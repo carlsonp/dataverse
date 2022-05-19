@@ -14,15 +14,15 @@ WORKDIR /
 RUN useradd --create-home --shell /bin/bash dataverse
 
 # https://guides.dataverse.org/en/5.8/installation/prerequisites.html
-RUN wget https://s3-eu-west-1.amazonaws.com/payara.fish/Payara+Downloads/5.2022.1/payara-5.2022.1.zip
+RUN wget https://s3.eu-west-1.amazonaws.com/payara.fish/Payara+Downloads/6.2022.1.Alpha2/payara-6.2022.1.Alpha2.zip
 
-RUN unzip payara-5.2022.1.zip && \
-  mv payara5 /usr/local && \
-  rm payara-5.2022.1.zip
+RUN unzip payara-6.2022.1.Alpha2.zip && \
+  mv payara6 /usr/local && \
+  rm payara-6.2022.1.Alpha2.zip
 
-RUN chown -R root:root /usr/local/payara5 && \
-  chown dataverse /usr/local/payara5/glassfish/lib && \
-  chown -R dataverse:dataverse /usr/local/payara5/glassfish/domains/domain1
+RUN chown -R root:root /usr/local/payara6 && \
+  chown dataverse /usr/local/payara6/glassfish/lib && \
+  chown -R dataverse:dataverse /usr/local/payara6/glassfish/domains/domain1
 
 # ENV JAVA_HOME "/usr/lib/jvm/java-11-openjdk-${ARCHITECTURE}"
 # RUN export JAVA_HOME="$(dirname $(dirname $(readlink -f $(which java))))"
@@ -50,11 +50,11 @@ RUN mkdir -p /home/dataverse/.aws/
 COPY --chown=dataverse:dataverse ./conf/docker-compose/dataverse/config /home/dataverse/.aws/config
 COPY --chown=dataverse:dataverse ./conf/docker-compose/dataverse/credentials /home/dataverse/.aws/credentials
 
-RUN cp -R /home/dataverse/.aws/ /usr/local/payara5/glassfish/domains/domain1/
+RUN cp -R /home/dataverse/.aws/ /usr/local/payara6/glassfish/domains/domain1/
 
 # if you want to speed up the Maven build you can copy over
 # cached packages here
-# COPY --chown=dataverse:dataverse ./conf/docker-compose/dataverse/.m2/ /home/dataverse/.m2/
+COPY --chown=dataverse:dataverse ./conf/docker-compose/dataverse/.m2/ /home/dataverse/.m2/
 
 # copy over sourcecode and build files needed to compile the .war
 # as well as installer files
