@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dataverse-deployment
+  labels:
+    app: dataverse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dataverse
+  template:
+    metadata:
+      labels:
+        app: dataverse
+    spec:
+      containers:
+      - name: dataverse
+        image: <ACR-NAME>.azurecr.io/dataverse/dataverse:v1
+        volumeMounts:
+        - name: persistent-storage
+          mountPath: /usr/local/payara5/glassfish/domains/domain1/files
+        envFrom:
+        - secretRef:
+            name: my-env-list
+        ports:
+        - containerPort: 8080
+      volumes:
+      - name: persistent-storage
+        persistentVolumeClaim:
+          claimName: dataverse-pvc
+---
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: dataverse-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: azureblob-fuse-premium
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dataverse-service
+spec:
+  selector:
+    app: dataverse
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
