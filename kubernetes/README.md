@@ -4,6 +4,7 @@
 1. AKS + ACR Deployed
 2. Helm CLI
 3. Azure CLI
+4. [Azure Blob CSI Driver Installed](https://docs.microsoft.com/en-us/azure/aks/azure-blob-csi?tabs=Blobfuse) on AKS
 
 ## Steps
 
@@ -126,4 +127,10 @@ Finally, apply the manifest:
 
 ```bash
 kubectl apply -f manifest.yaml
+```
+
+To expose the application locally, run the following:
+
+```bash
+kubectl port-forward service/dataverse-service 8080:8080 
 ```

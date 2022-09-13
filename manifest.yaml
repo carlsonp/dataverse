@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: dataverse
-        image: <ACR-NAME>.azurecr.io/dataverse/dataverse:v1
+        image: acrdataverse0913.azurecr.io/dataverse:dataverse
         volumeMounts:
         - name: persistent-storage
           mountPath: /usr/local/payara5/glassfish/domains/domain1/files
