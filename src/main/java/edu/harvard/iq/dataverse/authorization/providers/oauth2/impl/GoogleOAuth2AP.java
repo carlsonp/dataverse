@@ -8,9 +8,9 @@ import edu.harvard.iq.dataverse.util.BundleUtil;
 import java.io.StringReader;
 import java.util.Arrays;
 import java.util.UUID;
-import javax.json.Json;
-import javax.json.JsonObject;
-import javax.json.JsonReader;
+import jakarta.json.Json;
+import jakarta.json.JsonObject;
+import jakarta.json.JsonReader;
 
 /**
  *
@@ -63,10 +63,4 @@ public class GoogleOAuth2AP extends AbstractOAuth2AuthenticationProvider {
             return new ParsedUserResponse(displayInfo, persistentUserId, username);
         }
     }
-
-    @Override
-    public boolean isDisplayIdentifier() {
-        return false;
-    }
-    
 }

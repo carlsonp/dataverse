@@ -1,7 +1,9 @@
 package edu.harvard.iq.dataverse;
 
 import edu.harvard.iq.dataverse.util.MarkupChecker;
+import edu.harvard.iq.dataverse.util.PersonOrOrgUtil;
 import edu.harvard.iq.dataverse.util.BundleUtil;
+import edu.harvard.iq.dataverse.util.DataFileComparator;
 import edu.harvard.iq.dataverse.DatasetFieldType.FieldType;
 import edu.harvard.iq.dataverse.branding.BrandingUtil;
 import edu.harvard.iq.dataverse.dataset.DatasetUtil;
@@ -14,9 +16,10 @@ import edu.harvard.iq.dataverse.util.json.JsonUtil;
 import edu.harvard.iq.dataverse.util.json.NullSafeJsonBuilder;
 import edu.harvard.iq.dataverse.workflows.WorkflowComment;
 import java.io.Serializable;
-import java.net.URL;
+import java.net.MalformedURLException;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.sql.Timestamp;
-import java.text.DateFormat;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.*;
@@ -24,38 +27,37 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
-import javax.json.Json;
-import javax.json.JsonArray;
-import javax.json.JsonArrayBuilder;
-import javax.json.JsonObject;
-import javax.json.JsonObjectBuilder;
-import javax.persistence.CascadeType;
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.EnumType;
-import javax.persistence.Enumerated;
-import javax.persistence.GeneratedValue;
-import javax.persistence.GenerationType;
-import javax.persistence.Id;
-import javax.persistence.Index;
-import javax.persistence.JoinColumn;
-import javax.persistence.ManyToOne;
-import javax.persistence.NamedQueries;
-import javax.persistence.NamedQuery;
-import javax.persistence.OneToMany;
-import javax.persistence.OneToOne;
-import javax.persistence.OrderBy;
-import javax.persistence.Table;
-import javax.persistence.Temporal;
-import javax.persistence.TemporalType;
-import javax.persistence.Transient;
-import javax.persistence.UniqueConstraint;
-import javax.persistence.Version;
-import javax.validation.ConstraintViolation;
-import javax.validation.Validation;
-import javax.validation.Validator;
-import javax.validation.ValidatorFactory;
-import javax.validation.constraints.Size;
+import jakarta.json.Json;
+import jakarta.json.JsonArray;
+import jakarta.json.JsonArrayBuilder;
+import jakarta.json.JsonObject;
+import jakarta.json.JsonObjectBuilder;
+import jakarta.persistence.CascadeType;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Index;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.NamedQueries;
+import jakarta.persistence.NamedQuery;
+import jakarta.persistence.OneToMany;
+import jakarta.persistence.OneToOne;
+import jakarta.persistence.OrderBy;
+import jakarta.persistence.Table;
+import jakarta.persistence.Temporal;
+import jakarta.persistence.TemporalType;
+import jakarta.persistence.Transient;
+import jakarta.persistence.UniqueConstraint;
+import jakarta.persistence.Version;
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validation;
+import jakarta.validation.Validator;
+import jakarta.validation.constraints.Size;
 import org.apache.commons.lang3.StringUtils;
 
 /**
@@ -66,16 +68,25 @@ import org.apache.commons.lang3.StringUtils;
 @NamedQueries({
     @NamedQuery(name = "DatasetVersion.findUnarchivedReleasedVersion",
                query = "SELECT OBJECT(o) FROM DatasetVersion AS o WHERE o.dataset.harvestedFrom IS NULL and o.releaseTime IS NOT NULL and o.archivalCopyLocation IS NULL"
-    )})
+    ), 
+    @NamedQuery(name = "DatasetVersion.findById", 
+                query = "SELECT o FROM DatasetVersion o LEFT JOIN FETCH o.fileMetadatas WHERE o.id=:id"), 
+    @NamedQuery(name = "DatasetVersion.findByDataset",
+                query = "SELECT o FROM DatasetVersion o WHERE o.dataset.id=:datasetId ORDER BY o.versionNumber DESC, o.minorVersionNumber DESC"), 
+    @NamedQuery(name = "DatasetVersion.findReleasedByDataset",
+                query = "SELECT o FROM DatasetVersion o WHERE o.dataset.id=:datasetId AND o.versionState=edu.harvard.iq.dataverse.DatasetVersion.VersionState.RELEASED ORDER BY o.versionNumber DESC, o.minorVersionNumber DESC")/*,
+    @NamedQuery(name = "DatasetVersion.findVersionElements",
+                query = "SELECT o.id, o.versionState, o.versionNumber, o.minorVersionNumber FROM DatasetVersion o WHERE o.dataset.id=:datasetId ORDER BY o.versionNumber DESC, o.minorVersionNumber DESC")*/})
     
     
 @Entity
 @Table(indexes = {@Index(columnList="dataset_id")},
         uniqueConstraints = @UniqueConstraint(columnNames = {"dataset_id,versionnumber,minorversionnumber"}))
-@ValidateVersionNote(versionNote = "versionNote", versionState = "versionState")
+@ValidateDeaccessionNote(deaccessionNote = "deaccessionNote", versionState = "versionState")
 public class DatasetVersion implements Serializable {
 
     private static final Logger logger = Logger.getLogger(DatasetVersion.class.getCanonicalName());
+    private static final Validator validator = Validation.buildDefaultValidatorFactory().getValidator();
 
     /**
      * Convenience comparator to compare dataset versions by their version number.
@@ -93,6 +104,10 @@ public class DatasetVersion implements Serializable {
             }
         }
     };
+    public static final JsonObjectBuilder compareVersions(DatasetVersion originalVersion, DatasetVersion newVersion) {
+        DatasetVersionDifference diff = new DatasetVersionDifference(newVersion, originalVersion);
+        return diff.compareVersionsAsJson();
+    }
 
     // TODO: Determine the UI implications of various version states
     //IMPORTANT: If you add a new value to this enum, you will also have to modify the
@@ -101,7 +116,8 @@ public class DatasetVersion implements Serializable {
         DRAFT, RELEASED, ARCHIVED, DEACCESSIONED
     }
 
-    public static final int ARCHIVE_NOTE_MAX_LENGTH = 1000;
+    public static final int DEACCESSION_NOTE_MAX_LENGTH = 1000;
+    public static final int DEACCESSION_LINK_MAX_LENGTH = 1260; //Long enough to cover the case where a legacy deaccessionLink(256 char) and archiveNote (1000) are combined (with a space)
     public static final int VERSION_NOTE_MAX_LENGTH = 1000;
     
     //Archival copies: Status message required components
@@ -124,10 +140,16 @@ public class DatasetVersion implements Serializable {
     private Long versionNumber;
     private Long minorVersionNumber;
     
+    //This is used for the deaccession reason
+    @Size(min=0, max=DEACCESSION_NOTE_MAX_LENGTH)
+    @Column(length = DEACCESSION_NOTE_MAX_LENGTH)
+    private String deaccessionNote;
+    
+    //This is a plain text, optional reason for the version's creation
     @Size(min=0, max=VERSION_NOTE_MAX_LENGTH)
     @Column(length = VERSION_NOTE_MAX_LENGTH)
     private String versionNote;
-    
+
     /*
      * @todo versionState should never be null so when we are ready, uncomment
      * the `nullable = false` below.
@@ -164,12 +186,6 @@ public class DatasetVersion implements Serializable {
     @Temporal(value = TemporalType.TIMESTAMP)
     private Date archiveTime;
     
-    @Size(min=0, max=ARCHIVE_NOTE_MAX_LENGTH)
-    @Column(length = ARCHIVE_NOTE_MAX_LENGTH)
-    //@ValidateURL() - this validation rule was making a bunch of older legacy datasets invalid;
-    // removed pending further investigation (v4.13)
-    private String archiveNote;
-    
     // Originally a simple string indicating the location of the archival copy. As
     // of v5.12, repurposed to provide a more general json archival status (failure,
     // pending, success) and message (serialized as a string). The archival copy
@@ -178,7 +194,9 @@ public class DatasetVersion implements Serializable {
     @Column(nullable=true, columnDefinition = "TEXT")
     private String archivalCopyLocation;
     
-    
+    //This is used for the deaccession reason
+    @Size(min=0, max=DEACCESSION_LINK_MAX_LENGTH)
+    @Column(length = DEACCESSION_LINK_MAX_LENGTH)
     private String deaccessionLink;
 
     @Transient
@@ -242,14 +260,34 @@ public class DatasetVersion implements Serializable {
     }
     
     public List<FileMetadata> getFileMetadatasSorted() {
-        Collections.sort(fileMetadatas, FileMetadata.compareByLabel);
+ 
+        /*
+         * fileMetadatas can sometimes be an
+         * org.eclipse.persistence.indirection.IndirectList When that happens, the
+         * comparator in the Collections.sort below is not called, possibly due to
+         * https://bugs.eclipse.org/bugs/show_bug.cgi?id=446236 which is Java 1.8+
+         * specific Converting to an ArrayList solves the problem, but the longer term
+         * solution may be in avoiding the IndirectList or moving to a new version of
+         * the jar it is in.
+         */
+        if(!(fileMetadatas instanceof ArrayList)) {
+            List<FileMetadata> newFMDs = new ArrayList<FileMetadata>();
+            for(FileMetadata fmd: fileMetadatas) {
+                newFMDs.add(fmd);
+            }
+            setFileMetadatas(newFMDs);
+        }
+        
+        DataFileComparator dfc = new DataFileComparator();
+        Collections.sort(fileMetadatas, dfc.compareBy(true, null!=FileMetadata.getCategorySortOrder(), "name", true));
         return fileMetadatas;
     }
     
     public List<FileMetadata> getFileMetadatasSortedByLabelAndFolder() {
         ArrayList<FileMetadata> fileMetadatasCopy = new ArrayList<>();
         fileMetadatasCopy.addAll(fileMetadatas);
-        Collections.sort(fileMetadatasCopy, FileMetadata.compareByLabelAndFolder);
+        DataFileComparator dfc = new DataFileComparator();
+        Collections.sort(fileMetadatasCopy, dfc.compareBy(true, null!=FileMetadata.getCategorySortOrder(), "name", true));
         return fileMetadatasCopy;
     }
     
@@ -328,19 +366,6 @@ public class DatasetVersion implements Serializable {
         this.archiveTime = archiveTime;
     }
 
-    public String getArchiveNote() {
-        return archiveNote;
-    }
-
-    public void setArchiveNote(String note) {
-        // @todo should this be using bean validation for trsting note length?
-        if (note != null && note.length() > ARCHIVE_NOTE_MAX_LENGTH) {
-            throw new IllegalArgumentException("Error setting archiveNote: String length is greater than maximum (" + ARCHIVE_NOTE_MAX_LENGTH + ")."
-                    + "  StudyVersion id=" + id + ", archiveNote=" + note);
-        }
-        this.archiveNote = note;
-    }
-    
     public String getArchivalCopyLocation() {
         return archivalCopyLocation;
     }
@@ -384,11 +409,21 @@ public class DatasetVersion implements Serializable {
     }
 
     public void setDeaccessionLink(String deaccessionLink) {
+        if (deaccessionLink != null && deaccessionLink.length() > DEACCESSION_LINK_MAX_LENGTH) {
+            throw new IllegalArgumentException("Error setting deaccessionLink: String length is greater than maximum (" + DEACCESSION_LINK_MAX_LENGTH + ")."
+                    + "  StudyVersion id=" + id + ", deaccessionLink=" + deaccessionLink);
+        }
         this.deaccessionLink = deaccessionLink;
     }
 
-    public GlobalId getDeaccessionLinkAsGlobalId() {
-        return new GlobalId(deaccessionLink);
+    public String getDeaccessionLinkAsURLString() {
+        String dLink = null;
+        try {
+            dLink = new URI(deaccessionLink).toURL().toExternalForm();
+        } catch (URISyntaxException | MalformedURLException e) {
+            logger.fine("Invalid deaccessionLink - not a URL: " + deaccessionLink);
+        }
+        return dLink;
     }
 
     public Date getCreateTime() {
@@ -457,8 +492,8 @@ public class DatasetVersion implements Serializable {
     }
 
  
-    public String getVersionNote() {
-        return versionNote;
+    public String getDeaccessionNote() {
+        return deaccessionNote;
     }
 
     public DatasetVersionDifference getDefaultVersionDifference() {
@@ -508,12 +543,12 @@ public class DatasetVersion implements Serializable {
         return null;
     }
 
-    public void setVersionNote(String note) {
-        if (note != null && note.length() > VERSION_NOTE_MAX_LENGTH) {
-            throw new IllegalArgumentException("Error setting versionNote: String length is greater than maximum (" + VERSION_NOTE_MAX_LENGTH + ")."
-                    + "  StudyVersion id=" + id + ", versionNote=" + note);
+    public void setDeaccessionNote(String note) {
+        if (note != null && note.length() > DEACCESSION_NOTE_MAX_LENGTH) {
+            throw new IllegalArgumentException("Error setting deaccessionNote: String length is greater than maximum (" + DEACCESSION_NOTE_MAX_LENGTH + ")."
+                    + "  StudyVersion id=" + id + ", deaccessionNote=" + note);
         }
-        this.versionNote = note;
+        this.deaccessionNote = note;
     }
    
     public Long getVersionNumber() {
@@ -842,12 +877,26 @@ public class DatasetVersion implements Serializable {
         return MarkupChecker.stripAllTags(getDescription());
     }
 
-    public List<String> getDescriptionsPlainText() {
-        List<String> plainTextDescriptions = new ArrayList<>();
+    /* This method is (only) used in creating schema.org json-jd where Google requires a text description <5000 chars.
+     * 
+     * @returns - a single string composed of all descriptions (joined with \n if more than one) truncated with a trailing '...' if >=5000 chars
+     */
+    public String getDescriptionsPlainTextTruncated() {
+        List<String> plainTextDescriptions = new ArrayList<String>();
+        
         for (String htmlDescription : getDescriptions()) {
             plainTextDescriptions.add(MarkupChecker.stripAllTags(htmlDescription));
         }
-        return plainTextDescriptions;
+        String description = String.join("\n", plainTextDescriptions);
+        if (description.length() >= 5000) {
+            int endIndex = description.substring(0, 4997).lastIndexOf(" ");
+            if (endIndex == -1) {
+                //There are no spaces so just break anyway
+                endIndex = 4997;
+            }
+            description = description.substring(0, endIndex) + "...";
+        }
+        return description;
     }
 
     /**
@@ -1299,7 +1348,7 @@ public class DatasetVersion implements Serializable {
                     }
                     geoCoverages.add(coverageItem);
                 }
-
+                break;
             }
         }
         return geoCoverages;
@@ -1313,24 +1362,45 @@ public class DatasetVersion implements Serializable {
                 for (DatasetFieldCompoundValue publication : dsf.getDatasetFieldCompoundValues()) {
                     DatasetRelPublication relatedPublication = new DatasetRelPublication();
                     for (DatasetField subField : publication.getChildDatasetFields()) {
-                        if (subField.getDatasetFieldType().getName().equals(DatasetFieldConstant.publicationCitation)) {
-                            String citation = subField.getDisplayValue();
-                            relatedPublication.setText(citation);
-                        }
-
-                        
-                        if (subField.getDatasetFieldType().getName().equals(DatasetFieldConstant.publicationURL)) {
-                            // We have to avoid using subField.getDisplayValue() here - because the DisplayFormatType 
-                            // for this url metadata field is likely set up so that the display value is automatically 
-                            // turned into a clickable HTML HREF block, which we don't want to end in our Schema.org JSON-LD output.
-                            // So we want to use the raw value of the field instead, with 
-                            // minimal HTML sanitation, just in case (this would be done on all URLs in getDisplayValue()).
-                            String url = subField.getValue();
-                            if (StringUtils.isBlank(url) || DatasetField.NA_VALUE.equals(url)) {
-                                relatedPublication.setUrl("");
-                            } else {
-                                relatedPublication.setUrl(MarkupChecker.sanitizeBasicHTML(url));
-                            }
+                        switch (subField.getDatasetFieldType().getName()) {
+                            case DatasetFieldConstant.publicationCitation:
+                                relatedPublication.setText(subField.getDisplayValue());
+                                break;
+                            case DatasetFieldConstant.publicationURL:
+                                // We have to avoid using subField.getDisplayValue() here - because the
+                                // DisplayFormatType
+                                // for this url metadata field is likely set up so that the display value is
+                                // automatically
+                                // turned into a clickable HTML HREF block, which we don't want to end in our
+                                // Schema.org
+                                // JSON-LD output. So we want to use the raw value of the field instead, with
+                                // minimal HTML
+                                // sanitation, just in case (this would be done on all URLs in
+                                // getDisplayValue()).
+                                String url = subField.getValue();
+                                if (StringUtils.isBlank(url) || DatasetField.NA_VALUE.equals(url)) {
+                                    relatedPublication.setUrl("");
+                                } else {
+                                    relatedPublication.setUrl(MarkupChecker.sanitizeBasicHTML(url));
+                                }
+                                break;
+                            case DatasetFieldConstant.publicationIDType:
+                                // QDR idType has a trailing : now (Aug 2021)
+                                // Get value without any display modifications
+                                subField.getDatasetFieldType().setDisplayFormat("#VALUE");
+                                relatedPublication.setIdType(subField.getDisplayValue());
+                                break;
+                            case DatasetFieldConstant.publicationIDNumber:
+                                // Get sanitized value without any display modifications
+                                subField.getDatasetFieldType().setDisplayFormat("#VALUE");
+                                relatedPublication.setIdNumber(subField.getDisplayValue());
+                                break;
+                            case DatasetFieldConstant.publicationRelationType:
+                                List<String> values = subField.getValues_nondisplay();
+                                if (!values.isEmpty()) {
+                                    relatedPublication.setRelationType(values.get(0)); //only one value allowed
+                                }
+                                break;
                         }
                     }
                     relatedPublications.add(relatedPublication);
@@ -1352,17 +1422,14 @@ public class DatasetVersion implements Serializable {
     }
 
     /**
-     * @return String containing the version's series title
+     * @return List of Strings containing the version's series title(s)
      */
-    public String getSeriesTitle() {
+    public List<String>  getSeriesTitles() {
 
         List<String> seriesNames = getCompoundChildFieldValues(DatasetFieldConstant.series,
                 DatasetFieldConstant.seriesName);
-        if (seriesNames.size() > 1) {
-            logger.warning("More than one series title found for datasetVersion: " + this.id);
-        }
         if (!seriesNames.isEmpty()) {
-            return seriesNames.get(0);
+            return seriesNames;
         } else {
             return null;
         }
@@ -1418,11 +1485,14 @@ public class DatasetVersion implements Serializable {
     }
 
     public String getCitation(boolean html) {
-        return getCitation(html, false);
+        return getCitation(DataCitation.Format.Internal, html, false);
+    }
+    public String getCitation(boolean html, boolean anonymized) {
+        return getCitation(DataCitation.Format.Internal, html, anonymized);
     }
     
-    public String getCitation(boolean html, boolean anonymized) {
-        return new DataCitation(this).toString(html, anonymized);
+    public String getCitation(DataCitation.Format format, boolean html, boolean anonymized) {
+        return new DataCitation(this).toString(format, html, anonymized);
     }
     
     public Date getCitationDate() {
@@ -1674,8 +1744,6 @@ public class DatasetVersion implements Serializable {
 
     public List<ConstraintViolation<DatasetField>> validateRequired() {
         List<ConstraintViolation<DatasetField>> returnListreturnList = new ArrayList<>();
-        ValidatorFactory factory = Validation.buildDefaultValidatorFactory();
-        Validator validator = factory.getValidator();
         for (DatasetField dsf : this.getFlatDatasetFields()) {
             dsf.setValidationMessage(null); // clear out any existing validation message
             Set<ConstraintViolation<DatasetField>> constraintViolations = validator.validate(dsf);
@@ -1689,11 +1757,42 @@ public class DatasetVersion implements Serializable {
         return returnListreturnList;
     }
     
+    public boolean isValid() {
+        // first clone to leave the original untouched
+        final DatasetVersion newVersion = this.cloneDatasetVersion();
+        // initDatasetFields
+        newVersion.setDatasetFields(newVersion.initDatasetFields());
+        // remove special "N/A" values and empty values
+        newVersion.removeEmptyValues();
+        // check validity of present fields and detect missing mandatory fields
+        return newVersion.validate().isEmpty();
+    }
+
+    private void removeEmptyValues() {
+        if (this.getDatasetFields() != null) {
+            for (DatasetField dsf : this.getDatasetFields()) {
+                removeEmptyValues(dsf);
+            }
+        }
+    }
+
+    private void removeEmptyValues(DatasetField dsf) {
+        if (dsf.getDatasetFieldType().isPrimitive()) { // primitive
+            final Iterator<DatasetFieldValue> i = dsf.getDatasetFieldValues().iterator();
+            while (i.hasNext()) {
+                final String v = i.next().getValue();
+                if (StringUtils.isBlank(v) || DatasetField.NA_VALUE.equals(v)) {
+                    i.remove();
+                }
+            }
+        } else {
+            dsf.getDatasetFieldCompoundValues().forEach(cv -> cv.getChildDatasetFields().forEach(v -> removeEmptyValues(v)));
+        }
+    }
+
     public Set<ConstraintViolation> validate() {
         Set<ConstraintViolation> returnSet = new HashSet<>();
 
-        ValidatorFactory factory = Validation.buildDefaultValidatorFactory();
-        Validator validator = factory.getValidator();
 
         for (DatasetField dsf : this.getFlatDatasetFields()) {
             dsf.setValidationMessage(null); // clear out any existing validation message
@@ -1780,7 +1879,7 @@ public class DatasetVersion implements Serializable {
     // So something will need to be modified to accommodate this. -- L.A.  
     /**
      * We call the export format "Schema.org JSON-LD" and extensive Javadoc can
-     * be found in {@link SchemaDotOrgExporter}.
+     * be found in {@link edu.harvard.iq.dataverse.export.SchemaDotOrgExporter}.
      */
     public String getJsonLd() {
         // We show published datasets only for "datePublished" field below.
@@ -1802,27 +1901,46 @@ public class DatasetVersion implements Serializable {
         for (DatasetAuthor datasetAuthor : this.getDatasetAuthors()) {
             JsonObjectBuilder author = Json.createObjectBuilder();
             String name = datasetAuthor.getName().getDisplayValue();
+            String identifierAsUrl = datasetAuthor.getIdentifierAsUrl();
             DatasetField authorAffiliation = datasetAuthor.getAffiliation();
             String affiliation = null;
             if (authorAffiliation != null) {
-                affiliation = datasetAuthor.getAffiliation().getDisplayValue();
+                affiliation = datasetAuthor.getAffiliation().getValue();
             }
-            // We are aware of "givenName" and "familyName" but instead of a person it might be an organization such as "Gallup Organization".
-            //author.add("@type", "Person");
-            author.add("name", name);
-            // We are aware that the following error is thrown by https://search.google.com/structured-data/testing-tool
-            // "The property affiliation is not recognized by Google for an object of type Thing."
-            // Someone at Google has said this is ok.
-            // This logic could be moved into the `if (authorAffiliation != null)` block above.
-            if (!StringUtil.isEmpty(affiliation)) {
-                author.add("affiliation", affiliation);
+            JsonObject entity = PersonOrOrgUtil.getPersonOrOrganization(name, false, (identifierAsUrl!=null));
+            String givenName= entity.containsKey("givenName") ? entity.getString("givenName"):null;
+            String familyName= entity.containsKey("familyName") ? entity.getString("familyName"):null;
+            
+            if (entity.getBoolean("isPerson")) {
+                // Person
+                author.add("@type", "Person");
+                if (givenName != null) {
+                    author.add("givenName", givenName);
+                }
+                if (familyName != null) {
+                    author.add("familyName", familyName);
+                }
+                if (!StringUtil.isEmpty(affiliation)) {
+                    author.add("affiliation", Json.createObjectBuilder().add("@type", "Organization").add("name", affiliation));
+                }
+                //Currently all possible identifier URLs are for people not Organizations
+                if(identifierAsUrl != null) {
+                    author.add("sameAs", identifierAsUrl);
+                    //Legacy - not sure if these are still useful
+                    author.add("@id", identifierAsUrl);
+                    author.add("identifier", identifierAsUrl);
+
+                }
+            } else {
+                // Organization
+                author.add("@type", "Organization");
+                if (!StringUtil.isEmpty(affiliation)) {
+                    author.add("parentOrganization", Json.createObjectBuilder().add("@type", "Organization").add("name", affiliation));
+                }
             }
-            String identifierAsUrl = datasetAuthor.getIdentifierAsUrl();
-            if (identifierAsUrl != null) {
-                // It would be valid to provide an array of identifiers for authors but we have decided to only provide one.
-                author.add("@id", identifierAsUrl);
-                author.add("identifier", identifierAsUrl);
-            }
+            // Both cases
+            author.add("name", entity.getString("fullName"));
+            //And add to the array
             authors.add(author);
         }
         JsonArray authorsArray = authors.build();
@@ -1859,16 +1977,8 @@ public class DatasetVersion implements Serializable {
         job.add("dateModified", this.getPublicationDateAsString());
         job.add("version", this.getVersionNumber().toString());
 
-        JsonArrayBuilder descriptionsArray = Json.createArrayBuilder();
-        List<String> descriptions = this.getDescriptionsPlainText();
-        for (String description : descriptions) {
-            descriptionsArray.add(description);
-        }
-        /**
-         * In Dataverse 4.8.4 "description" was a single string but now it's an
-         * array.
-         */
-        job.add("description", descriptionsArray);
+        String description = this.getDescriptionsPlainTextTruncated();
+        job.add("description", description);
 
         /**
          * "keywords" - contains subject(s), datasetkeyword(s) and topicclassification(s)
@@ -1892,11 +2002,16 @@ public class DatasetVersion implements Serializable {
         job.add("keywords", keywords);
         
         /**
-         * citation: (multiple) related publication citation and URLs, if
-         * present.
+         * citation: (multiple) related publication citation and URLs, if present.
          *
-         * In Dataverse 4.8.4 "citation" was an array of strings but now it's an
-         * array of objects.
+         * Schema.org allows text or a CreativeWork object. Google recommends text with
+         * either the full citation or the PID URL. This code adds an object if we have
+         * the citation text for the work and/or an entry in the URL field (i.e.
+         * https://doi.org/...) The URL is reported as the 'url' field while the
+         * citation text (which would normally include the name) is reported as 'name'
+         * since there doesn't appear to be a better field ('text', which was used
+         * previously, is the actual text of the creative work).
+         * 
          */
         List<DatasetRelPublication> relatedPublications = getRelatedPublications();
         if (!relatedPublications.isEmpty()) {
@@ -1911,11 +2026,12 @@ public class DatasetVersion implements Serializable {
                 JsonObjectBuilder citationEntry = Json.createObjectBuilder();
                 citationEntry.add("@type", "CreativeWork");
                 if (pubCitation != null) {
-                    citationEntry.add("text", pubCitation);
+                    citationEntry.add("name", pubCitation);
                 }
                 if (pubUrl != null) {
                     citationEntry.add("@id", pubUrl);
                     citationEntry.add("identifier", pubUrl);
+                    citationEntry.add("url", pubUrl);
                 }
                 if (addToArray) {
                     jsonArrayBuilder.add(citationEntry);
@@ -1957,13 +2073,14 @@ public class DatasetVersion implements Serializable {
             job.add("license",DatasetUtil.getLicenseURI(this));
         }
         
+        String installationBrandName = BrandingUtil.getInstallationBrandName();
+        
         job.add("includedInDataCatalog", Json.createObjectBuilder()
                 .add("@type", "DataCatalog")
-                .add("name", BrandingUtil.getRootDataverseCollectionName())
+                .add("name", installationBrandName)
                 .add("url", SystemConfig.getDataverseSiteUrlStatic())
         );
-
-        String installationBrandName = BrandingUtil.getInstallationBrandName();
+        
         /**
          * Both "publisher" and "provider" are included but they have the same
          * values. Some services seem to prefer one over the other.
@@ -2006,13 +2123,11 @@ public class DatasetVersion implements Serializable {
             for (FileMetadata fileMetadata : fileMetadatasSorted) {
                 JsonObjectBuilder fileObject = NullSafeJsonBuilder.jsonObjectBuilder();
                 String filePidUrlAsString = null;
-                URL filePidUrl = fileMetadata.getDataFile().getGlobalId().toURL();
-                if (filePidUrl != null) {
-                    filePidUrlAsString = filePidUrl.toString();
-                }
+                GlobalId gid = fileMetadata.getDataFile().getGlobalId();
+                filePidUrlAsString = gid != null ? gid.asURL() : null;
                 fileObject.add("@type", "DataDownload");
                 fileObject.add("name", fileMetadata.getLabel());
-                fileObject.add("fileFormat", fileMetadata.getDataFile().getContentType());
+                fileObject.add("encodingFormat", fileMetadata.getDataFile().getContentType());
                 fileObject.add("contentSize", fileMetadata.getDataFile().getFilesize());
                 fileObject.add("description", fileMetadata.getDescription());
                 fileObject.add("@id", filePidUrlAsString);
@@ -2021,10 +2136,8 @@ public class DatasetVersion implements Serializable {
                 if (hideFilesBoolean != null && hideFilesBoolean.equals("true")) {
                     // no-op
                 } else {
-                    if (FileUtil.isPubliclyDownloadable(fileMetadata)) {
-                        String nullDownloadType = null;
-                        fileObject.add("contentUrl", dataverseSiteUrl + FileUtil.getFileDownloadUrlPath(nullDownloadType, fileMetadata.getDataFile().getId(), false, fileMetadata.getId()));
-                    }
+                    String nullDownloadType = null;
+                    fileObject.add("contentUrl", dataverseSiteUrl + FileUtil.getFileDownloadUrlPath(nullDownloadType, fileMetadata.getDataFile().getId(), false, fileMetadata.getId()));
                 }
                 fileArray.add(fileObject);
             }
@@ -2050,4 +2163,17 @@ public class DatasetVersion implements Serializable {
         this.externalStatusLabel = externalStatusLabel;
     }
 
+    public String getVersionNote() {
+        return versionNote;
+    }
+
+    public void setVersionNote(String note) {
+        if (note != null && note.length() > VERSION_NOTE_MAX_LENGTH) {
+            throw new IllegalArgumentException("Error setting versionNote: String length is greater than maximum (" + VERSION_NOTE_MAX_LENGTH + ")."
+                    + "  StudyVersion id=" + id + ", versionNote=" + note);
+        }
+
+        this.versionNote = note;
+    }
 }
+

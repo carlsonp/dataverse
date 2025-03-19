@@ -20,18 +20,17 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import javax.ejb.EJB;
-import javax.ejb.EJBException;
-import javax.json.Json;
-import javax.json.JsonArrayBuilder;
-import javax.validation.ConstraintViolation;
-import javax.validation.ConstraintViolationException;
-import javax.ws.rs.Consumes;
-import javax.ws.rs.GET;
-import javax.ws.rs.POST;
-import javax.ws.rs.Path;
-import javax.ws.rs.PathParam;
-import javax.ws.rs.core.Response;
+import jakarta.ejb.EJB;
+import jakarta.ejb.EJBException;
+import jakarta.json.Json;
+import jakarta.json.JsonArrayBuilder;
+import jakarta.validation.ConstraintViolationException;
+import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.PathParam;
+import jakarta.ws.rs.core.Response;
 
 import edu.harvard.iq.dataverse.util.BundleUtil;
 import edu.harvard.iq.dataverse.util.ConstraintViolationUtil;
@@ -41,9 +40,10 @@ import edu.harvard.iq.dataverse.util.json.NullSafeJsonBuilder;
 
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import javax.persistence.NoResultException;
-import javax.persistence.TypedQuery;
-import javax.ws.rs.core.Response.Status;
+import jakarta.persistence.NoResultException;
+import jakarta.persistence.TypedQuery;
+import jakarta.ws.rs.QueryParam;
+import jakarta.ws.rs.core.Response.Status;
 
 import java.io.BufferedInputStream;
 import java.io.FileOutputStream;
@@ -127,7 +127,7 @@ public class DatasetFieldServiceApi extends AbstractApiBean {
             String solrFieldSearchable = dsf.getSolrField().getNameSearchable();
             String solrFieldFacetable = dsf.getSolrField().getNameFacetable();
             String metadataBlock = dsf.getMetadataBlock().getName();
-            String uri=dsf.getUri();
+            String uri = dsf.getUri();
             boolean hasParent = dsf.isHasParent();
             boolean allowsMultiples = dsf.isAllowMultiples();
             boolean isRequired = dsf.isRequired();
@@ -207,7 +207,7 @@ public class DatasetFieldServiceApi extends AbstractApiBean {
     @GET
     @Path("loadNAControlledVocabularyValue")
     public Response loadNAControlledVocabularyValue() {
-        // the find will throw a javax.persistence.NoResultException if no values are in db
+        // the find will throw a NoResultException if no values are in db
 //            datasetFieldService.findNAControlledVocabularyValue();
         TypedQuery<ControlledVocabularyValue> naValueFinder = em.createQuery("SELECT OBJECT(o) FROM ControlledVocabularyValue AS o WHERE o.datasetFieldType is null AND o.strValue = :strvalue", ControlledVocabularyValue.class);
         naValueFinder.setParameter("strvalue", DatasetField.NA_VALUE);
@@ -244,7 +244,9 @@ public class DatasetFieldServiceApi extends AbstractApiBean {
             br = new BufferedReader(new FileReader("/" + file));
             while ((line = br.readLine()) != null) {
                 lineNumber++;
-                values = line.split(splitBy);
+                values = Arrays.stream(line.split(splitBy))
+                    .map(String::trim)
+                    .toArray(String[]::new);
                 if (values[0].startsWith("#")) { // Header row
                     switch (values[0]) {
                         case "#metadataBlock":
@@ -327,7 +329,7 @@ public class DatasetFieldServiceApi extends AbstractApiBean {
      */
     public String getGeneralErrorMessage(HeaderType header, int lineNumber, String message) {
         List<String> arguments = new ArrayList<>();
-        arguments.add(header.name());
+        arguments.add(header != null ? header.name() : "unknown");
         arguments.add(String.valueOf(lineNumber));
         arguments.add(message);
         return BundleUtil.getStringFromBundle("api.admin.datasetfield.load.GeneralErrorMessage", arguments);
@@ -335,9 +337,9 @@ public class DatasetFieldServiceApi extends AbstractApiBean {
 
     /**
      * Turn ArrayIndexOutOfBoundsException into an informative error message
-     * @param lineNumber
      * @param header
-     * @param e
+     * @param lineNumber
+     * @param wrongIndex
      * @return
      */
     public String getArrayIndexOutOfBoundMessage(HeaderType header,
@@ -488,9 +490,7 @@ public class DatasetFieldServiceApi extends AbstractApiBean {
     @Consumes("application/zip")
     @Path("loadpropertyfiles")
     public Response loadLanguagePropertyFile(File inputFile) {
-        try
-        {
-            ZipFile file = new ZipFile(inputFile);
+        try (ZipFile file = new ZipFile(inputFile)) {
             //Get file entries
             Enumeration<? extends ZipEntry> entries = file.entries();
 
@@ -502,20 +502,26 @@ public class DatasetFieldServiceApi extends AbstractApiBean {
             {
                 ZipEntry entry = entries.nextElement();
                 String dataverseLangFileName = dataverseLangDirectory + "/" + entry.getName();
-                FileOutputStream fileOutput = new FileOutputStream(dataverseLangFileName);
+                File entryFile = new File(dataverseLangFileName);
+                String canonicalPath = entryFile.getCanonicalPath();
+                if (canonicalPath.startsWith(dataverseLangDirectory + "/")) {
+                    try (FileOutputStream fileOutput = new FileOutputStream(dataverseLangFileName)) {
 
-                InputStream is = file.getInputStream(entry);
-                BufferedInputStream bis = new BufferedInputStream(is);
+                        InputStream is = file.getInputStream(entry);
+                        BufferedInputStream bis = new BufferedInputStream(is);
 
-                while (bis.available() > 0) {
-                    fileOutput.write(bis.read());
+                        while (bis.available() > 0) {
+                            fileOutput.write(bis.read());
+                        }
+                    }
+                } else {
+                    logger.log(Level.SEVERE, "Zip Slip prevented: uploaded zip file tried to write to {}", canonicalPath);
+                    return Response.status(400).entity("The zip file includes an illegal file path").build();
                 }
-                fileOutput.close();
             }
         }
-        catch(IOException e)
-        {
-            e.printStackTrace();
+        catch(IOException e) {
+            logger.log(Level.SEVERE, "Reading the language property zip file failed", e);
             return Response.status(500).entity("Internal server error. More details available at the server logs.").build();
         }
 
@@ -538,6 +544,21 @@ public class DatasetFieldServiceApi extends AbstractApiBean {
         }
 
         return dataverseLangDirectory;
+    }
+
+    /**
+     * Set setDisplayOnCreate for a DatasetFieldType.
+     */
+    @POST
+    @Path("/setDisplayOnCreate")
+    public Response setDisplayOnCreate(@QueryParam("datasetFieldType") String datasetFieldTypeIn, @QueryParam("setDisplayOnCreate") Boolean setDisplayOnCreateIn) {
+        DatasetFieldType dft = datasetFieldService.findByName(datasetFieldTypeIn);
+        if (dft == null) {
+            return error(Status.NOT_FOUND, "Cound not find a DatasetFieldType by looking up " + datasetFieldTypeIn);
+        }
+        dft.setDisplayOnCreate(setDisplayOnCreateIn);
+        DatasetFieldType saved = datasetFieldService.save(dft);
+        return ok("DisplayOnCreate for DatasetFieldType " + saved.getName() + " is now " + saved.isDisplayOnCreate());
     }
 
 }

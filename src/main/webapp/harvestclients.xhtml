@@ -15,7 +15,7 @@
             <f:viewAction action="#{dataverseSession.updateLocaleInViewRoot}"/>
             <f:viewAction action="#{harvestingClientsPage.init}"/>
             <f:viewAction action="#{dataverseHeaderFragment.initBreadcrumbs(dataverseServiceBean.findRootDataverse())}"/>
-            <f:viewAction action="#{dataverseHeaderFragment.addBreadcrumb('/dashboard.xhtml?dataverseId='.concat(dataverse.id), bundle['dashboard.title'])}"/>
+            <f:viewAction action="#{dataverseHeaderFragment.addBreadcrumb('/dashboard.xhtml'.concat(empty param.dataverseId ? '': '?dataverseId='.concat(param.dataverseId)), bundle['dashboard.title'])}"/>
             <f:viewAction action="#{dataverseHeaderFragment.addBreadcrumb(bundle['harvestclients.title'])}"/>
         </f:metadata>
         <ui:composition template="/dataverse_template.xhtml">
@@ -203,6 +203,20 @@
                                         <p class="help-block" jsf:rendered="#{harvestingClientsPage.createMode}">#{bundle['harvestclients.newClientDialog.nickname.helptext']}</p>
                                     </div>
                                 </div>
+                                <!-- sourcename: -->
+                                <div class="form-group">
+                                    <label for="sourcename" class="col-sm-2 control-label">
+                                        <span>
+                                            #{bundle['harvestclients.newClientDialog.sourcename']}
+                                        </span>
+                                    </label>
+                                    <div class="col-sm-9">
+                                        <p:inputText id="sourcename" styleClass="form-control"
+                                                     value="#{harvestingClientsPage.sourceName}" />
+                                        <p:message for="sourcename"/>
+                                        <p class="help-block">#{bundle['harvestclients.newClientDialog.sourcename.helptext']}</p>
+                                    </div>
+                                </div>
 
                                 <!-- harvest type: (only oai, presently) -->
                                 <div class="form-group">
@@ -275,6 +289,23 @@
                                             <p:ajax process="@this" event="itemUnselect" />
                                         </p:autoComplete>
                                         <p:message for="destinationDataverseMenu"/>
+                                    </div>
+                                </div>
+                                
+                                <!-- (optional): custom header -->
+                                <div class="form-group">
+                                    <label for="customHeader" class="col-sm-2 control-label">
+                                        <span>
+                                            #{bundle['harvestclients.newClientDialog.customHeader']} 
+                                        </span>
+                                    </label>
+                                    <div class="col-sm-9">
+                                        <p:inputText id="customHeader" styleClass="form-control"
+                                                     value="#{harvestingClientsPage.newCustomHeader}"
+                                                     binding="#{harvestingClientsPage.newClientCustomHeaderInputField}"/>
+                                        <p:watermark for="customHeader" value="#{bundle['harvestclients.newClientDialog.customHeader.watermark']}" id="watermark1" />
+                                        <p:message for="customHeader"/>
+                                        <p class="help-block" jsf:rendered="#{harvestingClientsPage.createMode}">#{bundle['harvestclients.newClientDialog.customHeader.helptext']}</p>
                                     </div>
                                 </div>
 

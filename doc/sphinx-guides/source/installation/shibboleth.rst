@@ -76,7 +76,7 @@ A ``jk-connector`` network listener should have already been set up when you ran
 
 You can verify this with ``./asadmin list-network-listeners``. 
 
-This enables the `AJP protocol <http://en.wikipedia.org/wiki/Apache_JServ_Protocol>`_ used in Apache configuration files below.
+This enables the `AJP protocol <https://en.wikipedia.org/wiki/Apache_JServ_Protocol>`_ used in Apache configuration files below.
 
 SSLEngine Warning Workaround
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -93,7 +93,7 @@ Configure Apache
 Enforce HTTPS
 ~~~~~~~~~~~~~
 
-To prevent attacks such as `FireSheep <http://en.wikipedia.org/wiki/Firesheep>`_, HTTPS should be enforced. https://wiki.apache.org/httpd/RewriteHTTPToHTTPS provides a good method. You **could** copy and paste that those "rewrite rule" lines into Apache's main config file at ``/etc/httpd/conf/httpd.conf`` but using Apache's "virtual hosts" feature is recommended so that you can leave the main configuration file alone and drop a host-specific file into place.
+To prevent attacks such as `FireSheep <https://en.wikipedia.org/wiki/Firesheep>`_, HTTPS should be enforced. https://wiki.apache.org/httpd/RewriteHTTPToHTTPS provides a good method. You **could** copy and paste that those "rewrite rule" lines into Apache's main config file at ``/etc/httpd/conf/httpd.conf`` but using Apache's "virtual hosts" feature is recommended so that you can leave the main configuration file alone and drop a host-specific file into place.
 
 Below is an example of how "rewrite rule" lines look within a ``VirtualHost`` block. Download a :download:`sample file <../_static/installation/files/etc/httpd/conf.d/dataverse.example.edu.conf>` , edit it to substitute your own hostname under ``ServerName``, and place it at ``/etc/httpd/conf.d/dataverse.example.edu.conf`` or a filename that matches your hostname. The file must be in ``/etc/httpd/conf.d`` and must end in ".conf" to be included in Apache's configuration.
 
@@ -148,6 +148,8 @@ When configuring the ``MetadataProvider`` section of ``shibboleth2.xml`` you sho
 
 Most Dataverse installations will probably only want to authenticate users via Shibboleth using their home institution's Identity Provider (IdP).  The configuration above in ``shibboleth2.xml`` looks for the metadata for the Identity Providers (IdPs) in a file at ``/etc/shibboleth/dataverse-idp-metadata.xml``.  You can download a :download:`sample dataverse-idp-metadata.xml file <../_static/installation/files/etc/shibboleth/dataverse-idp-metadata.xml>` and that includes the SAMLtest IdP from https://samltest.id but you will want to edit this file to include the metadata from the Identity Provider you care about. The identity people at your institution will be able to provide you with this metadata and they will very likely ask for a list of attributes that the Dataverse Software requires, which are listed at :ref:`shibboleth-attributes`.
 
+.. _identity-federation:
+
 Identity Federation
 ^^^^^^^^^^^^^^^^^^^
 
@@ -158,6 +160,10 @@ The details of how to register with an identity federation are out of scope for 
 One of the benefits of using ``shibd`` is that it can be configured to periodically poll your identity federation for updates as new Identity Providers (IdPs) join the federation you've registered with. For the InCommon federation, `this page describes how to download and verify signed InCommon metadata every hour <https://spaces.at.internet2.edu/display/federation/Download+InCommon+metadata>`_. You can also see an example of this as ``maxRefreshDelay="3600"`` in the commented out section of the ``shibboleth2.xml`` file above.
 
 Once you've joined a federation the list of IdPs in the dropdown can be quite long! If you're curious how many are in the list you could try something like this: ``curl https://dataverse.example.edu/Shibboleth.sso/DiscoFeed | jq '.[].entityID' | wc -l``
+
+Joining the federation alone is not enough. For the InCommon Federation, one must `apply for Research and Scholarship entity category approval <https://spaces.at.internet2.edu/display/federation/Service+provider+-+apply+for+Research+and+Scholarship+category>`_ and minimally your identity management group must release the attributes listed below to either the service provider (Dataverse instance) or optimally to all R&S service providers. See also https://refeds.org/category/research-and-scholarship
+
+When Dataverse does not receive :ref:`shibboleth-attributes` it needs, users see a confusing message. In the User Guide there is a section called :ref:`fix-shib-login` that attempts to explain the R&S situation as simply as possible and also links back here for more technical detail.
 
 .. _shibboleth-attributes:
 
@@ -199,43 +205,21 @@ The first and easiest option is to set ``SELINUX=permisive`` in ``/etc/selinux/c
 Reconfigure SELinux to Accommodate Shibboleth
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The second (more involved) option is to use the ``checkmodule``, ``semodule_package``, and ``semodule`` tools to apply a local policy to make Shibboleth work with SELinux. Let's get started.
+Issue the following commands to allow Shibboleth to function when SELinux is enabled:
 
-Put Type Enforcement (TE) File in misc directory
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.. code-block:: none
 
-Copy and paste or download the :download:`shibboleth.te <../_static/installation/files/etc/selinux/targeted/src/policy/domains/misc/shibboleth.te>` Type Enforcement (TE) file below and put it at ``/etc/selinux/targeted/src/policy/domains/misc/shibboleth.te``.
+    # Allow httpd to connect to network and read content
+    sudo /usr/sbin/setsebool -P httpd_can_network_connect 1
+    sudo /usr/sbin/setsebool -P httpd_read_user_content 1
 
-.. literalinclude:: ../_static/installation/files/etc/selinux/targeted/src/policy/domains/misc/shibboleth.te
-   :language: text
+    # Allow httpd to connect to Shib socket
+    sudo grep httpd_t /var/log/audit/audit.log |/usr/bin/audit2allow -M allow_httpd_shibd_sock
+    sudo /usr/sbin/semodule -i allow_httpd_shibd_sock.pp
 
-(If you would like to know where the ``shibboleth.te`` came from and how to hack on it, please see the :doc:`/developers/selinux` section of the Developer Guide. Pull requests are welcome!)
-
-Navigate to misc directory
-^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-``cd /etc/selinux/targeted/src/policy/domains/misc``
-
-Run checkmodule
-^^^^^^^^^^^^^^^
-
-``checkmodule -M -m -o shibboleth.mod shibboleth.te``
-
-Run semodule_package
-^^^^^^^^^^^^^^^^^^^^
-
-``semodule_package -o shibboleth.pp -m shibboleth.mod``
-
-Silent is golden. No output is expected.
-
-Run semodule
-^^^^^^^^^^^^
-
-``semodule -i shibboleth.pp``
-
-Silent is golden. No output is expected. This will place a file in ``/etc/selinux/targeted/modules/active/modules/shibboleth.pp`` and include "shibboleth" in the output of ``semodule -l``. See the ``semodule`` man page if you ever want to remove or disable the module you just added.
-
-Congrats! You've made the creator of http://stopdisablingselinux.com proud. :)
+    # Allow httpd to read /var/cache/shibboleth
+    sudo /usr/sbin/semanage fcontext -a -t httpd_sys_content_t "/var/cache/shibboleth(/.*)?"
+    sudo /usr/sbin/restorecon -vR /var/cache/shibboleth
 
 Restart Apache and Shibboleth
 -----------------------------
@@ -407,6 +391,8 @@ Rather than looking up the user's id in the ``authenticateduser`` database table
 ``curl -H "X-Dataverse-key: $API_TOKEN" http://localhost:8080/api/admin/authenticatedUsers``
 
 Per above, you now need to tell the user to use the password reset feature to set a password for their local account.
+
+.. _shib-groups:
 
 Institution-Wide Shibboleth Groups
 ----------------------------------

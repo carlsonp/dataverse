@@ -11,9 +11,11 @@ This guide documents the functionality only available to superusers (such as "da
 **Contents:**
 
 .. toctree::
+   :maxdepth: 2
 
    dashboard
    external-tools
+   discoverability
    harvestclients
    harvestserver
    metadatacustomization
@@ -26,6 +28,7 @@ This guide documents the functionality only available to superusers (such as "da
    solr-search-index
    ip-groups
    mail-groups
+   collectionquotas
    monitoring
    reporting-tools-and-queries
    maintenance

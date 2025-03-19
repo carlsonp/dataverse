@@ -1,6 +1,6 @@
 package edu.harvard.iq.dataverse.datavariable;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import javax.xml.stream.XMLInputFactory;
 import javax.xml.stream.XMLStreamException;
@@ -12,7 +12,7 @@ import java.util.Set;
 import java.util.HashSet;
 import java.util.Collection;
 
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 
 public class VariableMetadataDDIParserTest {
 
@@ -66,16 +66,16 @@ public class VariableMetadataDDIParserTest {
         assertEquals(vm.getLiteralquestion(), "This is a literal question.");
         assertEquals(vm.getNotes(), "These are notes.\nA lot of them.");
         assertEquals(vm.getUniverse(),"Our universe");
-        assertEquals(false, vm.isIsweightvar());
-        assertEquals(false, vm.isWeighted());
+        assertFalse(vm.isIsweightvar());
+        assertFalse(vm.isWeighted());
 
         testCategoriesVar1(vm);
 
 
         vm =  vmMap.get(1169L);
         assertNotNull(vm);
-        assertEquals(false, vm.isIsweightvar());
-        assertEquals(true, vm.isWeighted());
+        assertFalse(vm.isIsweightvar());
+        assertTrue(vm.isWeighted());
         assertEquals(vm.getLabel(), "age_rollup"  );
 
         assertEquals(vm.getInterviewinstruction(), null);
@@ -90,8 +90,8 @@ public class VariableMetadataDDIParserTest {
 
         vm =  vmMap.get(1168L);
         assertNotNull(vm);
-        assertEquals(true, vm.isIsweightvar());
-        assertEquals(false, vm.isWeighted());
+        assertTrue(vm.isIsweightvar());
+        assertFalse(vm.isWeighted());
         assertEquals(vm.getLabel(), "weight"  );
         assertEquals(vm.getInterviewinstruction(), null);
         assertEquals(vm.getLiteralquestion(), "Literal question for weight");

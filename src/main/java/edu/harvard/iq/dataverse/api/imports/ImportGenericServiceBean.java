@@ -1,6 +1,8 @@
 package edu.harvard.iq.dataverse.api.imports;
 
 import com.google.gson.Gson;
+
+import edu.harvard.iq.dataverse.Dataset;
 import edu.harvard.iq.dataverse.DatasetFieldCompoundValue;
 import edu.harvard.iq.dataverse.DatasetFieldConstant;
 import edu.harvard.iq.dataverse.DatasetFieldServiceBean;
@@ -8,12 +10,15 @@ import edu.harvard.iq.dataverse.DatasetFieldType;
 import edu.harvard.iq.dataverse.DatasetVersion;
 import edu.harvard.iq.dataverse.ForeignMetadataFieldMapping;
 import edu.harvard.iq.dataverse.ForeignMetadataFormatMapping;
-import edu.harvard.iq.dataverse.GlobalId;
 import edu.harvard.iq.dataverse.MetadataBlockServiceBean;
 import edu.harvard.iq.dataverse.api.dto.*;  
 import edu.harvard.iq.dataverse.api.dto.FieldDTO;
 import edu.harvard.iq.dataverse.api.dto.MetadataBlockDTO;
+import edu.harvard.iq.dataverse.dataset.DatasetTypeServiceBean;
 import edu.harvard.iq.dataverse.license.LicenseServiceBean;
+import edu.harvard.iq.dataverse.pidproviders.doi.AbstractDOIProvider;
+import edu.harvard.iq.dataverse.pidproviders.handle.HandlePidProvider;
+import edu.harvard.iq.dataverse.pidproviders.perma.PermaLinkPidProvider;
 import edu.harvard.iq.dataverse.settings.SettingsServiceBean;
 import edu.harvard.iq.dataverse.util.StringUtil;
 import edu.harvard.iq.dataverse.util.json.JsonParseException;
@@ -27,19 +32,19 @@ import java.util.*;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import javax.ejb.EJB;
-import javax.ejb.EJBException;
-import javax.ejb.Stateless;
-import javax.inject.Named;
-import javax.json.Json;
+import jakarta.ejb.EJB;
+import jakarta.ejb.EJBException;
+import jakarta.ejb.Stateless;
+import jakarta.inject.Named;
+import jakarta.json.Json;
 import javax.xml.stream.XMLStreamConstants;
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamReader;
-import javax.json.JsonObject;
-import javax.json.JsonReader;
-import javax.persistence.EntityManager;
-import javax.persistence.NoResultException;
-import javax.persistence.PersistenceContext;
+import jakarta.json.JsonObject;
+import jakarta.json.JsonReader;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.NoResultException;
+import jakarta.persistence.PersistenceContext;
 import javax.xml.stream.XMLInputFactory;
 import net.handle.hdllib.HandleException;
 import net.handle.hdllib.HandleResolver;
@@ -67,8 +72,12 @@ public class ImportGenericServiceBean {
     
     @EJB
     SettingsServiceBean settingsService;
+
     @EJB
     LicenseServiceBean licenseService;
+
+    @EJB
+    DatasetTypeServiceBean datasetTypeService;
 
     @PersistenceContext(unitName = "VDCNet-ejbPU")
     private EntityManager em;
@@ -106,7 +115,7 @@ public class ImportGenericServiceBean {
             logger.fine(json);
             JsonReader jsonReader = Json.createReader(new StringReader(json));
             JsonObject obj = jsonReader.readObject();
-            DatasetVersion dv = new JsonParser(datasetFieldSvc, blockService, settingsService, licenseService).parseDatasetVersion(obj, datasetVersion);
+            DatasetVersion dv = new JsonParser(datasetFieldSvc, blockService, settingsService, licenseService, datasetTypeService).parseDatasetVersion(obj, datasetVersion);
         } catch (XMLStreamException ex) {
             //Logger.getLogger("global").log(Level.SEVERE, null, ex);
             throw new EJBException("ERROR occurred while parsing XML fragment  ("+xmlToParse.substring(0, 64)+"...); ", ex);
@@ -141,12 +150,16 @@ public class ImportGenericServiceBean {
 
     }
     
-    // Helper method for importing harvested Dublin Core xml.
+    // Helper methods for importing harvested Dublin Core xml.
     // Dublin Core is considered a mandatory, built in metadata format mapping. 
     // It is distributed as required content, in reference_data.sql. 
     // Note that arbitrary formatting tags are supported for the outer xml
     // wrapper. -- L.A. 4.5
     public DatasetDTO processOAIDCxml(String DcXmlToParse) throws XMLStreamException {
+        return processOAIDCxml(DcXmlToParse, null, false);
+    }
+    
+    public DatasetDTO processOAIDCxml(String DcXmlToParse, String oaiIdentifier, boolean preferSuppliedIdentifier) throws XMLStreamException {
         // look up DC metadata mapping: 
         
         ForeignMetadataFormatMapping dublinCoreMapping = findFormatMappingByName(DCTERMS);
@@ -176,18 +189,37 @@ public class ImportGenericServiceBean {
         
         datasetDTO.getDatasetVersion().setVersionState(DatasetVersion.VersionState.RELEASED);
         
-        // Our DC import handles the contents of the dc:identifier field 
-        // as an "other id". In the context of OAI harvesting, we expect 
-        // the identifier to be a global id, so we need to rearrange that: 
+        // In some cases, the identifier that we want to use for the dataset is 
+        // already supplied to the method explicitly. For example, in some 
+        // harvesting cases we'll want to use the OAI identifier (the identifier 
+        // from the <header> section of the OAI record) for that purpose, without
+        // expecting to find a valid persistent id in the body of the DC record:
         
-        String identifier = getOtherIdFromDTO(datasetDTO.getDatasetVersion());
-        logger.fine("Imported identifier: "+identifier);
+        String globalIdentifier; 
         
-        String globalIdentifier = reassignIdentifierAsGlobalId(identifier, datasetDTO);
-        logger.fine("Detected global identifier: "+globalIdentifier);
+        if (oaiIdentifier != null) {
+            logger.fine("Attempting to use " + oaiIdentifier + " as the persistentId of the imported dataset");
+            
+            globalIdentifier = reassignIdentifierAsGlobalId(oaiIdentifier, datasetDTO);
+        } else {
+            // Our DC import handles the contents of the dc:identifier field 
+            // as an "other id". Unless we are using an externally supplied 
+            // global id, we will be using the first such "other id" that we 
+            // can parse and recognize as the global id for the imported dataset
+            // (note that this is the default behavior during harvesting),
+            // so we need to reaassign it accordingly: 
+            String identifier = selectIdentifier(datasetDTO.getDatasetVersion(), oaiIdentifier, preferSuppliedIdentifier);
+            logger.fine("Imported identifier: " + identifier);
+
+            globalIdentifier = reassignIdentifierAsGlobalId(identifier, datasetDTO);
+            logger.fine("Detected global identifier: " + globalIdentifier);
+        }
         
         if (globalIdentifier == null) {
-            throw new EJBException("Failed to find a global identifier in the OAI_DC XML record.");
+            String exceptionMsg = oaiIdentifier == null ? 
+                    "Failed to find a global identifier in the OAI_DC XML record." : 
+                    "Failed to parse the supplied identifier as a valid Persistent Id";
+            throw new EJBException(exceptionMsg);
         }
         
         return datasetDTO;
@@ -196,8 +228,17 @@ public class ImportGenericServiceBean {
     
     private void processXMLElement(XMLStreamReader xmlr, String currentPath, String openingTag, ForeignMetadataFormatMapping foreignFormatMapping, DatasetDTO datasetDTO) throws XMLStreamException {
         logger.fine("entering processXMLElement; ("+currentPath+")");
-        
-        for (int event = xmlr.next(); event != XMLStreamConstants.END_DOCUMENT; event = xmlr.next()) {
+
+        while (xmlr.hasNext()) {
+
+            int event;
+            try {
+                event = xmlr.next();
+            } catch (XMLStreamException ex) {
+                logger.warning("Error occurred in the XML parsing : " + ex.getMessage());
+                continue; // Skip Undeclared namespace prefix and Unexpected close tag related to com.ctc.wstx.exc.WstxParsingException
+            }
+
             if (event == XMLStreamConstants.START_ELEMENT) {
                 String currentElement = xmlr.getLocalName();
                 
@@ -258,9 +299,7 @@ public class ImportGenericServiceBean {
                             MetadataBlockDTO citationBlock = datasetDTO.getDatasetVersion().getMetadataBlocks().get(mappingDefinedFieldType.getMetadataBlock().getName());
                             citationBlock.addField(value);
                         }
-                    } else // Process the payload of this XML element:
-                    //xxString dataverseFieldName = mappingDefined.getDatasetfieldName();
-                    if (dataverseFieldName != null && !dataverseFieldName.isEmpty()) {
+                    } else if (dataverseFieldName != null && !dataverseFieldName.isEmpty()) {
                         DatasetFieldType dataverseFieldType = datasetfieldService.findByNameOpt(dataverseFieldName);
                         FieldDTO value;
                         if (dataverseFieldType != null) {
@@ -326,8 +365,20 @@ public class ImportGenericServiceBean {
         return value;
     }
     
-    private String getOtherIdFromDTO(DatasetVersionDTO datasetVersionDTO) {
+    public String selectIdentifier(DatasetVersionDTO datasetVersionDTO, String suppliedIdentifier) {
+        return selectIdentifier(datasetVersionDTO, suppliedIdentifier, false);
+    }
+    
+    private String selectIdentifier(DatasetVersionDTO datasetVersionDTO, String suppliedIdentifier, boolean preferSuppliedIdentifier) {
         List<String> otherIds = new ArrayList<>();
+        
+        if (suppliedIdentifier != null && preferSuppliedIdentifier) {
+            // This supplied identifier (in practice, his is likely the OAI-PMH 
+            // identifier from the <record> <header> section) will be our first 
+            // choice candidate for the pid of the imported dataset:
+            otherIds.add(suppliedIdentifier);
+        }
+        
         for (Map.Entry<String, MetadataBlockDTO> entry : datasetVersionDTO.getMetadataBlocks().entrySet()) {
             String key = entry.getKey();
             MetadataBlockDTO value = entry.getValue();
@@ -345,10 +396,20 @@ public class ImportGenericServiceBean {
                 }
             }
         }
+        
+        if (suppliedIdentifier != null && !preferSuppliedIdentifier) {
+            // Unless specifically instructed to prefer this extra identifier 
+            // (in practice, this is likely the OAI-PMH identifier from the 
+            // <record> <header> section), we will try to use it as the *last*
+            // possible candidate for the pid, so, adding it to the end of the 
+            // list:
+            otherIds.add(suppliedIdentifier);
+        }
+        
         if (!otherIds.isEmpty()) {
             // We prefer doi or hdl identifiers like "doi:10.7910/DVN/1HE30F"
             for (String otherId : otherIds) {
-                if (otherId.startsWith(GlobalId.DOI_PROTOCOL) || otherId.startsWith(GlobalId.HDL_PROTOCOL) || otherId.startsWith(GlobalId.DOI_RESOLVER_URL) || otherId.startsWith(GlobalId.HDL_RESOLVER_URL) || otherId.startsWith(GlobalId.HTTP_DOI_RESOLVER_URL) || otherId.startsWith(GlobalId.HTTP_HDL_RESOLVER_URL) || otherId.startsWith(GlobalId.DXDOI_RESOLVER_URL) || otherId.startsWith(GlobalId.HTTP_DXDOI_RESOLVER_URL)) {
+                if (otherId.startsWith(AbstractDOIProvider.DOI_PROTOCOL) || otherId.startsWith(HandlePidProvider.HDL_PROTOCOL) || otherId.startsWith(AbstractDOIProvider.DOI_RESOLVER_URL) || otherId.startsWith(HandlePidProvider.HDL_RESOLVER_URL) || otherId.startsWith(AbstractDOIProvider.HTTP_DOI_RESOLVER_URL) || otherId.startsWith(HandlePidProvider.HTTP_HDL_RESOLVER_URL) || otherId.startsWith(AbstractDOIProvider.DXDOI_RESOLVER_URL) || otherId.startsWith(AbstractDOIProvider.HTTP_DXDOI_RESOLVER_URL)) {
                     return otherId;
                 }
             }
@@ -357,7 +418,7 @@ public class ImportGenericServiceBean {
                 try {
                     HandleResolver hr = new HandleResolver();
                     hr.resolveHandle(otherId);
-                    return GlobalId.HDL_PROTOCOL + ":" + otherId;
+                    return HandlePidProvider.HDL_PROTOCOL + ":" + otherId;
                 } catch (HandleException e) {
                     logger.fine("Not a valid handle: " + e.toString());
                 }
@@ -371,6 +432,8 @@ public class ImportGenericServiceBean {
      * protocol/authority/identifier parts that are assigned to the datasetDTO.
      * The name reflects the original purpose but it is now used in ImportDDIServiceBean as well.
      */
+    
+    //ToDo - sync with GlobalId.parsePersistentId(String) ? - that currently doesn't do URL forms, but could
     public String reassignIdentifierAsGlobalId(String identifierString, DatasetDTO datasetDTO) {
 
         int index1 = identifierString.indexOf(':');
@@ -382,24 +445,29 @@ public class ImportGenericServiceBean {
        
         String protocol = identifierString.substring(0, index1);
         
-        if (GlobalId.DOI_PROTOCOL.equals(protocol) || GlobalId.HDL_PROTOCOL.equals(protocol)) {
-            logger.fine("Processing hdl:- or doi:-style identifier : "+identifierString);        
+        if (AbstractDOIProvider.DOI_PROTOCOL.equals(protocol) || HandlePidProvider.HDL_PROTOCOL.equals(protocol) || PermaLinkPidProvider.PERMA_PROTOCOL.equals(protocol)) {
+            logger.fine("Processing hdl:- or doi:- or perma:-style identifier : "+identifierString);        
         
         } else if ("http".equalsIgnoreCase(protocol) || "https".equalsIgnoreCase(protocol)) {
             
             // We also recognize global identifiers formatted as global resolver URLs:
-            
-            if (identifierString.startsWith(GlobalId.HDL_RESOLVER_URL) || identifierString.startsWith(GlobalId.HTTP_HDL_RESOLVER_URL)) {
+            //ToDo - refactor index1 always has -1 here so that we can use index1+1 later
+            //ToDo - single map of protocol/url, are all three cases the same then?
+            if (identifierString.startsWith(HandlePidProvider.HDL_RESOLVER_URL) || identifierString.startsWith(HandlePidProvider.HTTP_HDL_RESOLVER_URL)) {
                 logger.fine("Processing Handle identifier formatted as a resolver URL: "+identifierString);
-                protocol = GlobalId.HDL_PROTOCOL;
-                index1 = (identifierString.startsWith(GlobalId.HDL_RESOLVER_URL)) ? GlobalId.HDL_RESOLVER_URL.length() - 1 : GlobalId.HTTP_HDL_RESOLVER_URL.length() - 1;
+                protocol = HandlePidProvider.HDL_PROTOCOL;
+                index1 = (identifierString.startsWith(HandlePidProvider.HDL_RESOLVER_URL)) ? HandlePidProvider.HDL_RESOLVER_URL.length() - 1 : HandlePidProvider.HTTP_HDL_RESOLVER_URL.length() - 1;
                 index2 = identifierString.indexOf("/", index1 + 1);
-            } else if (identifierString.startsWith(GlobalId.DOI_RESOLVER_URL) || identifierString.startsWith(GlobalId.HTTP_DOI_RESOLVER_URL) || identifierString.startsWith(GlobalId.DXDOI_RESOLVER_URL) || identifierString.startsWith(GlobalId.HTTP_DXDOI_RESOLVER_URL)) {
+            } else if (identifierString.startsWith(AbstractDOIProvider.DOI_RESOLVER_URL) || identifierString.startsWith(AbstractDOIProvider.HTTP_DOI_RESOLVER_URL) || identifierString.startsWith(AbstractDOIProvider.DXDOI_RESOLVER_URL) || identifierString.startsWith(AbstractDOIProvider.HTTP_DXDOI_RESOLVER_URL)) {
                 logger.fine("Processing DOI identifier formatted as a resolver URL: "+identifierString);
-                protocol = GlobalId.DOI_PROTOCOL;
-                identifierString = identifierString.replace(GlobalId.DXDOI_RESOLVER_URL, GlobalId.DOI_RESOLVER_URL);
-                identifierString = identifierString.replace(GlobalId.HTTP_DXDOI_RESOLVER_URL, GlobalId.HTTP_DOI_RESOLVER_URL);
-                index1 = (identifierString.startsWith(GlobalId.DOI_RESOLVER_URL)) ? GlobalId.DOI_RESOLVER_URL.length() - 1 : GlobalId.HTTP_DOI_RESOLVER_URL.length() - 1;
+                protocol = AbstractDOIProvider.DOI_PROTOCOL;
+                identifierString = identifierString.replace(AbstractDOIProvider.DXDOI_RESOLVER_URL, AbstractDOIProvider.DOI_RESOLVER_URL);
+                identifierString = identifierString.replace(AbstractDOIProvider.HTTP_DXDOI_RESOLVER_URL, AbstractDOIProvider.HTTP_DOI_RESOLVER_URL);
+                index1 = (identifierString.startsWith(AbstractDOIProvider.DOI_RESOLVER_URL)) ? AbstractDOIProvider.DOI_RESOLVER_URL.length() - 1 : AbstractDOIProvider.HTTP_DOI_RESOLVER_URL.length() - 1;
+                index2 = identifierString.indexOf("/", index1 + 1);
+            } else if (identifierString.startsWith(PermaLinkPidProvider.PERMA_RESOLVER_URL + Dataset.TARGET_URL)) {
+                protocol = PermaLinkPidProvider.PERMA_PROTOCOL;
+                index1 = PermaLinkPidProvider.PERMA_RESOLVER_URL.length() + + Dataset.TARGET_URL.length() - 1; 
                 index2 = identifierString.indexOf("/", index1 + 1);
             } else {
                 logger.warning("HTTP Url in supplied as the identifier is neither a Handle nor DOI resolver: "+identifierString);

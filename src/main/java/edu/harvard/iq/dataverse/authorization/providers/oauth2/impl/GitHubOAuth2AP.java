@@ -9,9 +9,9 @@ import edu.harvard.iq.dataverse.authorization.providers.shib.ShibUtil;
 import edu.harvard.iq.dataverse.util.BundleUtil;
 import java.io.StringReader;
 import java.util.Collections;
-import javax.json.Json;
-import javax.json.JsonObject;
-import javax.json.JsonReader;
+import jakarta.json.Json;
+import jakarta.json.JsonObject;
+import jakarta.json.JsonReader;
 
 /**
  * IDP adaptor for GitHub.com
@@ -58,30 +58,4 @@ public class GitHubOAuth2AP extends AbstractOAuth2AuthenticationProvider {
         }
         
     }
-
-    @Override
-    public boolean isDisplayIdentifier() {
-        return false;
-    }
-
-    @Override
-    public String getPersistentIdName() {
-        return BundleUtil.getStringFromBundle("auth.providers.persistentUserIdName.github");
-    }
-
-    @Override
-    public String getPersistentIdDescription() {
-        return BundleUtil.getStringFromBundle("auth.providers.persistentUserIdTooltip.github");
-    }
-
-    @Override
-    public String getPersistentIdUrlPrefix() {
-        return null;
-    }
-
-    @Override
-    public String getLogo() {
-        return null;
-    }
-    
 }

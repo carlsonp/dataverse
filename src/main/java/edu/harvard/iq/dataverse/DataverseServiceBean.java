@@ -18,8 +18,11 @@ import edu.harvard.iq.dataverse.engine.command.DataverseRequest;
 import edu.harvard.iq.dataverse.search.IndexServiceBean;
 import edu.harvard.iq.dataverse.search.SolrIndexServiceBean;
 import edu.harvard.iq.dataverse.search.SolrSearchResult;
+import edu.harvard.iq.dataverse.util.BundleUtil;
+import edu.harvard.iq.dataverse.storageuse.StorageQuota;
 import edu.harvard.iq.dataverse.util.StringUtil;
 import edu.harvard.iq.dataverse.util.SystemConfig;
+
 import java.io.File;
 import java.io.IOException;
 import java.sql.Timestamp;
@@ -30,19 +33,28 @@ import java.util.List;
 import java.util.Map;
 import java.util.logging.Logger;
 import java.util.Properties;
-import java.util.concurrent.Future;
-import javax.ejb.EJB;
-import javax.ejb.Stateless;
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.json.Json;
-import javax.json.JsonArrayBuilder;
-import javax.persistence.EntityManager;
-import javax.persistence.NoResultException;
-import javax.persistence.NonUniqueResultException;
-import javax.persistence.PersistenceContext;
-import javax.persistence.TypedQuery;
+
+import edu.harvard.iq.dataverse.validation.JSONDataValidation;
+import jakarta.ejb.EJB;
+import jakarta.ejb.Stateless;
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+import jakarta.json.Json;
+import jakarta.json.JsonArrayBuilder;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.NoResultException;
+import jakarta.persistence.NonUniqueResultException;
+import jakarta.persistence.PersistenceContext;
+import jakarta.persistence.TypedQuery;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.solr.client.solrj.SolrServerException;
+import org.everit.json.schema.Schema;
+import org.everit.json.schema.ValidationException;
+import org.everit.json.schema.loader.SchemaLoader;
+import org.json.JSONObject;
+import org.json.JSONTokener;
 
 /**
  *
@@ -79,6 +91,9 @@ public class DataverseServiceBean implements java.io.Serializable {
     
     @EJB
     PermissionServiceBean permissionService;
+    
+    @EJB
+    DataverseFieldTypeInputLevelServiceBean dataverseFieldTypeInputLevelService;
     
     @EJB
     SystemConfig systemConfig;
@@ -252,14 +267,18 @@ public class DataverseServiceBean implements java.io.Serializable {
             return null;
         }
     }
-    
-	public boolean hasData( Dataverse dv ) {
-		TypedQuery<Long> amountQry = em.createNamedQuery("Dataverse.ownedObjectsById", Long.class)
-								.setParameter("id", dv.getId());
-		
-		return (amountQry.getSingleResult()>0);
-	}
-	
+
+    public boolean hasData(Dataverse dataverse) {
+        return (getChildCount(dataverse) > 0);
+    }
+
+    public Long getChildCount(Dataverse dataverse) {
+        TypedQuery<Long> amountQry = em.createNamedQuery("Dataverse.ownedObjectsById", Long.class)
+                .setParameter("id", dataverse.getId());
+
+        return amountQry.getSingleResult();
+    }
+
     public boolean isRootDataverseExists() {
         long count = em.createQuery("SELECT count(dv) FROM Dataverse dv WHERE dv.owner.id=null", Long.class).getSingleResult();
         return (count == 1);
@@ -346,52 +365,15 @@ public class DataverseServiceBean implements java.io.Serializable {
         } 
         return null;
     }
-    
-    /*
-    public boolean isDataverseLogoThumbnailAvailable(Dataverse dataverse, User user) {    
-        if (dataverse == null) {
-            return false; 
-        }
-                
-        // First, check if the dataverse has a defined logo: 
-        
-        //if (dataverse.getDataverseTheme() != null && dataverse.getDataverseTheme().getLogo() != null && !dataverse.getDataverseTheme().getLogo().equals("")) {
-            File dataverseLogoFile = getLogo(dataverse);
-            if (dataverseLogoFile != null) {
-                String logoThumbNailPath = null;
 
-                if (dataverseLogoFile.exists()) {
-                    logoThumbNailPath = ImageThumbConverter.generateImageThumbnailFromFile(dataverseLogoFile.getAbsolutePath(), 48);
-                    if (logoThumbNailPath != null) {
-                        return true;
-                    }
-                }
-            }
-        //}
-        */
-        // If there's no uploaded logo for this dataverse, go through its 
-        // [released] datasets and see if any of them have card images:
-        // 
-        // TODO:
-        // Discuss/Decide if we really want to do this - i.e., go through every
-        // file in every dataset below... 
-        // -- L.A. 4.0 beta14
-        /*
-        for (Dataset dataset : datasetService.findPublishedByOwnerId(dataverse.getId())) {
-            if (dataset != null) {
-                DatasetVersion releasedVersion = dataset.getReleasedVersion();
-                
-                if (releasedVersion != null) {
-                    if (datasetService.isDatasetCardImageAvailable(releasedVersion, user)) {
-                        return true;
-                    }
-                }
-            }
-        }   */     
-        /*
-        return false; 
-    } */
-        
+    public String getDataverseLogoThumbnailAsUrl(Long dvId) {
+        File dataverseLogoFile = getLogoById(dvId);
+        if (dataverseLogoFile != null && dataverseLogoFile.exists()) {
+            return SystemConfig.getDataverseSiteUrlStatic() + "/api/access/dvCardImage/" + dvId;
+        }
+        return null;
+    }
+
     private File getLogo(Dataverse dataverse) {
         if (dataverse.getId() == null) {
             return null; 
@@ -399,16 +381,7 @@ public class DataverseServiceBean implements java.io.Serializable {
         
         DataverseTheme theme = dataverse.getDataverseTheme(); 
         if (theme != null && theme.getLogo() != null && !theme.getLogo().isEmpty()) {
-            Properties p = System.getProperties();
-            String domainRoot = p.getProperty("com.sun.aas.instanceRoot");
-  
-            if (domainRoot != null && !"".equals(domainRoot)) {
-                return new File (domainRoot + File.separator + 
-                    "docroot" + File.separator + 
-                    "logos" + File.separator + 
-                    dataverse.getLogoOwnerId() + File.separator + 
-                    theme.getLogo());
-            }
+            return ThemeWidgetFragment.getLogoDir(dataverse.getLogoOwnerId()).resolve(theme.getLogo()).toFile();
         }
             
         return null;         
@@ -452,7 +425,7 @@ public class DataverseServiceBean implements java.io.Serializable {
         Object[] result;
         
         try {
-                result = (Object[]) em.createNativeQuery("SELECT logo, logoFormat FROM dataversetheme WHERE dataverse_id = " + id).getSingleResult();
+            result = (Object[]) em.createNativeQuery("SELECT logo, logoFormat, logothumbnail FROM dataversetheme WHERE dataverse_id = " + id).getSingleResult();
             
         } catch (Exception ex) {
             return null;
@@ -478,6 +451,10 @@ public class DataverseServiceBean implements java.io.Serializable {
                 theme.setLogoFormat(DataverseTheme.ImageFormat.SQUARE);
                     break;
             }
+        }
+
+        if (result[2] != null) {
+            theme.setLogoThumbnail((String) result[2]);
         }
         
         return theme;
@@ -543,7 +520,19 @@ public class DataverseServiceBean implements java.io.Serializable {
 
         return dataverseList;
     }
-    
+    public List<Dataverse> filterDataversesForUnLinking(String query, DataverseRequest req, Dataset dataset) {
+        List<Object> alreadyLinkeddv_ids = em.createNativeQuery("SELECT linkingdataverse_id FROM datasetlinkingdataverse WHERE dataset_id = " + dataset.getId()).getResultList();
+        List<Dataverse> dataverseList = new ArrayList<>();
+        if (alreadyLinkeddv_ids != null && !alreadyLinkeddv_ids.isEmpty()) {
+            alreadyLinkeddv_ids.stream().map((testDVId) -> this.find(testDVId)).forEachOrdered((dataverse) -> {
+                if (this.permissionService.requestOn(req, dataverse).has(Permission.PublishDataset)) {
+                    dataverseList.add(dataverse);
+                }
+            });
+        }
+        return dataverseList;
+    }
+
     public List<Dataverse> filterDataversesForHosting(String pattern, DataverseRequest req) {
 
         // Find the dataverses matching the search parameters: 
@@ -928,5 +917,344 @@ public class DataverseServiceBean implements java.io.Serializable {
         return em.createNativeQuery(cqString).getResultList();
     }
 
+    public  String getCollectionDatasetSchema(String dataverseAlias) {
+        return getCollectionDatasetSchema(dataverseAlias, null);
+    }
+    public  String getCollectionDatasetSchema(String dataverseAlias, Map<String, Map<String,List<String>>> schemaChildMap) {
+        
+        Dataverse testDV = this.findByAlias(dataverseAlias);
+        
+        while (!testDV.isMetadataBlockRoot()) {
+            if (testDV.getOwner() == null) {
+                break; // we are at the root; which by definition is metadata block root, regardless of the value
+            }
+            testDV = testDV.getOwner();
+        }
+        
+        /* Couldn't get the 'return base if no extra required fields to work with the path provided
+        leaving it as 'out of scope' for now SEK 11/27/2023
+
+        List<DataverseFieldTypeInputLevel> required = new ArrayList<>();
+
+        required = dataverseFieldTypeInputLevelService.findRequiredByDataverseId(testDV.getId());
+        
+        if (required == null || required.isEmpty()){
+            String pathToJsonFile = "src/main/resources/edu/harvas/iq/dataverse/baseDatasetSchema.json";
+            String baseSchema = getBaseSchemaStringFromFile(pathToJsonFile);
+            if (baseSchema != null && !baseSchema.isEmpty()){
+                return baseSchema;
+            }
+        }
+        
+        */
+        List<MetadataBlock> selectedBlocks = new ArrayList<>();
+        List<DatasetFieldType> requiredDSFT = new ArrayList<>();
+        
+        selectedBlocks.addAll(testDV.getMetadataBlocks());
+
+        // Process all fields in all metadata blocks
+        for (MetadataBlock mdb : selectedBlocks) {
+            for (DatasetFieldType dsft : mdb.getDatasetFieldTypes()) {
+                if (!dsft.isChild()) {
+                    // Get or set the input level settings for the parent field
+                    DataverseFieldTypeInputLevel dsfIl = dataverseFieldTypeInputLevelService.findByDataverseIdDatasetFieldTypeId(testDV.getId(), dsft.getId());
+                    if (dsfIl != null) {
+                        dsft.setRequiredDV(dsfIl.isRequired());
+                        dsft.setInclude(dsfIl.isInclude());
+                        dsft.setLocalDisplayOnCreate(dsfIl.getDisplayOnCreate());
+                    } else {
+                        dsft.setRequiredDV(dsft.isRequired());
+                        dsft.setInclude(true);
+                        // Default displayOnCreate to true for required fields
+                        dsft.setLocalDisplayOnCreate(dsft.isRequired());
+                    }
+                    List<String> childrenRequired = new ArrayList<>();
+                    List<String> childrenAllowed = new ArrayList<>();
+                    if (dsft.isHasChildren()) {
+                        for (DatasetFieldType child : dsft.getChildDatasetFieldTypes()) {
+                            DataverseFieldTypeInputLevel dsfIlChild = dataverseFieldTypeInputLevelService.findByDataverseIdDatasetFieldTypeId(testDV.getId(), child.getId());
+                            if (dsfIlChild != null) {
+                                child.setRequiredDV(dsfIlChild.isRequired());
+                                child.setInclude(dsfIlChild.isInclude());
+                                child.setLocalDisplayOnCreate(dsfIlChild.getDisplayOnCreate());
+                            } else {
+                                child.setRequiredDV(child.isRequired() && dsft.isRequired());
+                                child.setInclude(true);
+                                // Default displayOnCreate to true for required child fields
+                                child.setLocalDisplayOnCreate(child.isRequired());
+                            }
+                            if (child.isRequired()) {
+                                childrenRequired.add(child.getName());
+                            }
+                            childrenAllowed.add(child.getName());
+                        }
+                    }
+                    
+                    if (schemaChildMap != null) {
+                        Map<String, List<String>> map = new HashMap<>();
+                        map.put("required", childrenRequired);
+                        map.put("allowed", childrenAllowed);
+                        schemaChildMap.put(dsft.getName(), map);
+                    }
+                    
+                    if(dsft.isRequiredDV()){
+                        requiredDSFT.add(dsft);
+                    }
+                }
+            }            
+        }
+        
+        String reqMDBNames = "";
+        List<MetadataBlock> hasReqFields = new ArrayList<>();
+        String retval = datasetSchemaPreface;
+        
+        // Build list of metadata blocks with required fields
+        for (MetadataBlock mdb : selectedBlocks) {
+            for (DatasetFieldType dsft : requiredDSFT) {
+                if (dsft.getMetadataBlock().equals(mdb)) {
+                    hasReqFields.add(mdb);
+                    if (!reqMDBNames.isEmpty()) reqMDBNames += ",";
+                    reqMDBNames += "\"" + mdb.getName() + "\"";
+                    break;
+                }
+            }
+        }
+        
+        // Generate schema for each metadata block
+        int countMDB = 0;
+        for (MetadataBlock mdb : hasReqFields) {
+            if (countMDB > 0) {
+                retval += ",";
+            }
+            retval += getCustomMDBSchema(mdb, requiredDSFT);
+            countMDB++;            
+        }
+        
+        retval += "\n                     }";
+        retval += endOfjson.replace("blockNames", reqMDBNames);
+
+        return retval;
+    }
     
+    private String getCustomMDBSchema (MetadataBlock mdb, List<DatasetFieldType> requiredDSFT){
+        String retval = "";
+        boolean mdbHasReqField = false;
+        int numReq = 0;
+        List<DatasetFieldType> requiredThisMDB = new ArrayList<>();
+        List<DatasetFieldType> allFieldsThisMDB = new ArrayList<>(mdb.getDatasetFieldTypes());
+        
+        // First collect all required fields for this metadata block
+        for (DatasetFieldType dsft : requiredDSFT) {
+            if(dsft.getMetadataBlock().equals(mdb)){
+                numReq++;
+                mdbHasReqField = true;
+                requiredThisMDB.add(dsft);
+            }
+        }
+
+        // Start building the schema for this metadata block
+        retval += startOfMDB.replace("blockName", mdb.getName());
+        
+        // Add minItems constraint only if there are required fields
+        if (mdbHasReqField) {
+            retval += minItemsTemplate.replace("numMinItems", Integer.toString(requiredThisMDB.size()));
+            
+            // Add contains validation for each required field
+            int count = 0;
+            for (DatasetFieldType dsft : requiredThisMDB) {
+                count++;
+                String reqValImp = reqValTemplate.replace("reqFieldTypeName", dsft.getName());
+                if (count < requiredThisMDB.size()) {
+                    retval += reqValImp + "\n";
+                } else {
+                    reqValImp = StringUtils.substring(reqValImp, 0, reqValImp.length() - 1);
+                    retval += reqValImp + "\n";
+                    retval += endOfReqVal;
+                }
+            }
+        } else {
+            // If no required fields, just close the items definition
+            retval += "\n                                    \"items\": {\n" +
+                     "                                        \"$ref\": \"#/$defs/field\"\n" +
+                     "                                    }\n" +
+                     "                                }\n" +
+                     "                            },\n" +
+                     "                            \"required\": [\"fields\"]\n" +
+                     "                        }";
+        }
+        
+        return retval;
+    }
+    
+    public String isDatasetJsonValid(String dataverseAlias, String jsonInput) {
+        Map<String, Map<String,List<String>>> schemaChildMap = new HashMap<>();
+        JSONObject rawSchema = new JSONObject(new JSONTokener(getCollectionDatasetSchema(dataverseAlias, schemaChildMap)));
+        
+        try {
+            Schema schema = SchemaLoader.load(rawSchema);
+            schema.validate(new JSONObject(jsonInput)); // throws a ValidationException if this object is invalid
+            JSONDataValidation.validate(schema, schemaChildMap, jsonInput); // throws a ValidationException if any objects are invalid
+        } catch (ValidationException vx) {
+            logger.info(BundleUtil.getStringFromBundle("dataverses.api.validate.json.failed") + " " + vx.getErrorMessage()); 
+            String accumulatedexceptions = "";
+            for (ValidationException va : vx.getCausingExceptions()){
+                accumulatedexceptions = accumulatedexceptions + va;
+                accumulatedexceptions = accumulatedexceptions.replace("org.everit.json.schema.ValidationException:", " ");
+            }
+            if (!accumulatedexceptions.isEmpty()){
+                return BundleUtil.getStringFromBundle("dataverses.api.validate.json.failed") + " "  + accumulatedexceptions;
+            } else {
+                return BundleUtil.getStringFromBundle("dataverses.api.validate.json.failed") + " "  + vx.getErrorMessage();
+            }
+            
+        } catch (Exception ex) {            
+            logger.info(BundleUtil.getStringFromBundle("dataverses.api.validate.json.exception") + ex.getLocalizedMessage());
+            return BundleUtil.getStringFromBundle("dataverses.api.validate.json.exception") + ex.getLocalizedMessage();
+        } 
+
+        return BundleUtil.getStringFromBundle("dataverses.api.validate.json.succeeded");
+    }
+    
+    static String getBaseSchemaStringFromFile(String pathToJsonFile) {
+        File datasetSchemaJson = new File(pathToJsonFile);
+        try {
+            String datasetSchemaAsJson = new String(Files.readAllBytes(Paths.get(datasetSchemaJson.getAbsolutePath())));
+            return datasetSchemaAsJson;
+        } catch (IOException ex) {
+            logger.info("IO - failed to get schema file  - will build on fly " +ex.getMessage());
+            return null;
+        } catch (Exception e){
+            logger.info("Other exception - failed to get schema file  - will build on fly. " + e.getMessage());
+            return null;
+        }
+    }
+    
+    private  String datasetSchemaPreface = 
+    "{\n" +
+    "    \"$schema\": \"http://json-schema.org/draft-04/schema#\",\n" +
+    "    \"$defs\": {\n" +
+    "    \"field\": {\n" + 
+    "        \"type\": \"object\",\n" +
+    "        \"required\": [\"typeClass\", \"multiple\", \"typeName\"],\n" +
+    "        \"properties\": {\n" + 
+    "            \"value\": {\n" +
+    "                \"anyOf\": [\n" +
+    "                    {\n" +
+    "                        \"type\": \"array\"\n" +
+    "                    },\n" +
+    "                    {\n" + 
+    "                        \"type\": \"string\"\n" +
+    "                    },\n" +
+    "                    {\n" +
+    "                        \"$ref\": \"#/$defs/field\"\n" +
+    "                    }\n" + 
+    "                ]\n" + 
+    "            },\n" + 
+    "            \"typeClass\": {\n" +
+    "                \"type\": \"string\"\n" +
+    "            },\n" +
+    "            \"multiple\": {\n" +
+    "                \"type\": \"boolean\"\n" +
+    "            },\n" +
+    "            \"typeName\": {\n" + 
+    "                \"type\": \"string\"\n" +
+    "            },\n" +
+    "            \"displayOnCreate\": {\n" +
+    "                \"type\": \"boolean\"\n" +
+    "            }\n" +
+    "        }\n" +
+    "    }\n" + 
+    "},\n" + 
+    "\"type\": \"object\",\n" +
+    "\"properties\": {\n" + 
+    "    \"datasetVersion\": {\n" + 
+    "        \"type\": \"object\",\n" +
+    "        \"properties\": {\n" + 
+    "           \"license\": {\n" + 
+    "                \"type\": \"object\",\n" + 
+    "                \"properties\": {\n" + 
+    "                    \"name\": {\n" +
+    "                        \"type\": \"string\"\n" + 
+    "                    },\n" + 
+    "                    \"uri\": {\n" + 
+    "                        \"type\": \"string\",\n" + 
+    "                        \"format\": \"uri\"\n" + 
+    "                   }\n" + 
+    "                },\n" + 
+    "                \"required\": [\"name\", \"uri\"]\n" + 
+    "            },\n" + 
+    "            \"metadataBlocks\": {\n" + 
+    "                \"type\": \"object\",\n" + 
+    "               \"properties\": {\n" +
+    ""  ;
+    
+    private String startOfMDB = "" +
+"                           \"blockName\": {\n" +
+"                            \"type\": \"object\",\n" +
+"                            \"properties\": {\n" +
+"                                \"fields\": {\n" +
+"                                    \"type\": \"array\",\n" +
+"                                    \"items\": {\n" +
+"                                        \"$ref\": \"#/$defs/field\"\n" +
+"                                    },";
+    
+    private String reqValTemplate = "                                        {\n" +
+"                                            \"contains\": {\n" +
+"                                                \"properties\": {\n" +
+"                                                    \"typeName\": {\n" +
+"                                                        \"const\": \"reqFieldTypeName\"\n" +
+"                                                    }\n" +
+"                                                }\n" +
+"                                            }\n" +
+"                                        },";
+    
+    private String minItemsTemplate = "\n                                    \"minItems\": numMinItems,\n" +
+"                                    \"allOf\": [\n";
+    private String endOfReqVal = "                                    ]\n" +
+"                                }\n" +
+"                            },\n" +
+"                            \"required\": [\"fields\"]\n" +
+"                        }";
+    
+    private String endOfjson = ",\n" +
+"                    \"required\": [blockNames]\n" +
+"                }\n" +
+"            },\n" +
+"            \"required\": [\"metadataBlocks\"]\n" +
+"        }\n" +
+"    },\n" +
+"    \"required\": [\"datasetVersion\"]\n" +
+"}\n";
+    
+    public void saveStorageQuota(Dataverse target, Long allocation) {
+        StorageQuota storageQuota = target.getStorageQuota();
+        
+        if (storageQuota != null) {
+            storageQuota.setAllocation(allocation);
+            em.merge(storageQuota);
+        } else {
+            storageQuota = new StorageQuota(); 
+            storageQuota.setDefinitionPoint(target);
+            storageQuota.setAllocation(allocation);
+            target.setStorageQuota(storageQuota);
+            em.persist(storageQuota);
+        }
+        em.flush();
+    }
+    
+    public void disableStorageQuota(StorageQuota storageQuota) {
+        if (storageQuota != null && storageQuota.getAllocation() != null) {
+            storageQuota.setAllocation(null);
+            em.merge(storageQuota);
+            em.flush();
+        }
+    }
+
+    /**
+     * Returns the total number of Dataverses
+     * @return the number of dataverse in the database
+     */
+    public long getDataverseCount() {
+        return em.createNamedQuery("Dataverse.countAll", Long.class).getSingleResult();
+    }
 }

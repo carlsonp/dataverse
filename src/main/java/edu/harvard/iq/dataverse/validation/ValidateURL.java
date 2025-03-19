@@ -6,13 +6,14 @@ import static java.lang.annotation.ElementType.FIELD;
 import java.lang.annotation.Retention;
 import static java.lang.annotation.RetentionPolicy.RUNTIME;
 import java.lang.annotation.Target;
-import javax.validation.Constraint;
-import javax.validation.Payload;
+import jakarta.validation.Constraint;
+import jakarta.validation.Payload;
 
 @Target({FIELD})
 @Retention(RUNTIME)
 @Constraint(validatedBy = {URLValidator.class})
 @Documented
+//Not currently used except in tests
 public @interface ValidateURL {
     String message() default "'${validatedValue}' {url.invalid}";
     String[] schemes() default {"http", "https", "ftp"};

@@ -6,7 +6,9 @@
 package edu.harvard.iq.dataverse;
 
 import edu.harvard.iq.dataverse.branding.BrandingUtil;
+import edu.harvard.iq.dataverse.dataset.DatasetType;
 import edu.harvard.iq.dataverse.harvest.client.HarvestingClient;
+import edu.harvard.iq.dataverse.pidproviders.AbstractPidProvider;
 
 import java.io.BufferedWriter;
 import java.io.ByteArrayOutputStream;
@@ -14,7 +16,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
-import java.text.ParseException;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -27,15 +29,34 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-import javax.ejb.EJBException;
+import jakarta.ejb.EJBException;
+import jakarta.json.JsonObject;
+import jakarta.ws.rs.core.MediaType;
+
 import javax.xml.stream.XMLOutputFactory;
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamWriter;
 
 import edu.harvard.iq.dataverse.util.BundleUtil;
 import edu.harvard.iq.dataverse.util.DateUtil;
+import edu.harvard.iq.dataverse.util.PersonOrOrgUtil;
+import edu.harvard.iq.dataverse.util.SystemConfig;
+import edu.harvard.iq.dataverse.util.json.JsonUtil;
+
 import org.apache.commons.text.StringEscapeUtils;
+
+import de.undercouch.citeproc.csl.CSLItemDataBuilder;
+import de.undercouch.citeproc.csl.CSLName;
+import de.undercouch.citeproc.csl.CSLNameBuilder;
+import de.undercouch.citeproc.csl.CSLType;
+import de.undercouch.citeproc.helper.json.JsonBuilder;
+import de.undercouch.citeproc.helper.json.StringJsonBuilderFactory;
+
 import org.apache.commons.lang3.StringUtils;
+
+import static edu.harvard.iq.dataverse.pidproviders.doi.AbstractDOIProvider.DOI_PROTOCOL;
+import static edu.harvard.iq.dataverse.pidproviders.handle.HandlePidProvider.HDL_PROTOCOL;
+import static edu.harvard.iq.dataverse.pidproviders.perma.PermaLinkPidProvider.PERMA_PROTOCOL;
 
 /**
  *
@@ -46,6 +67,7 @@ public class DataCitation {
     private static final Logger logger = Logger.getLogger(DataCitation.class.getCanonicalName());
 
     private List<String> authors = new ArrayList<String>();
+    private List<CSLName> cslAuthors = new ArrayList<CSLName>();
     private List<String> producers = new ArrayList<String>();
     private String title;
     private String fileTitle = null;
@@ -57,7 +79,7 @@ public class DataCitation {
     private String publisher;
     private boolean direct;
     private List<String> funders;
-    private String seriesTitle;
+    private List<String> seriesTitles;
     private String description;
     private List<String> datesOfCollection;
     private List<String> keywords;
@@ -66,8 +88,18 @@ public class DataCitation {
     private List<String> spatialCoverages;
 
     private List<DatasetField> optionalValues = new ArrayList<>();
-    private int optionalURLcount = 0; 
+    private int optionalURLcount = 0;
 
+    private DatasetType type; 
+
+    public enum Format {
+        Internal,
+        EndNote,
+        RIS,
+        BibTeX,
+        CSL
+    }
+    
     public DataCitation(DatasetVersion dsv) {
         this(dsv, false);
     }
@@ -135,13 +167,19 @@ public class DataCitation {
 
         datesOfCollection = dsv.getDatesOfCollection();
         title = dsv.getTitle();
-        seriesTitle = dsv.getSeriesTitle();
+        seriesTitles = dsv.getSeriesTitles();
         keywords = dsv.getKeywords();
         languages = dsv.getLanguages();
         spatialCoverages = dsv.getSpatialCoverages();
         publisher = getPublisherFrom(dsv);
         version = getVersionFrom(dsv);
+        type = getTypeFrom(dsv);
     }
+
+    private DatasetType getTypeFrom(DatasetVersion dsv) {
+        return dsv.getDataset().getDatasetType();
+    }
+
 
     public String getAuthorsString() {
         return String.join("; ", authors);
@@ -188,7 +226,45 @@ public class DataCitation {
     public String toString(boolean html) {
         return toString(html, false);
     }
+    
     public String toString(boolean html, boolean anonymized) {
+        return toString(Format.Internal, html, anonymized);
+    }
+    
+    public String toString(Format format, boolean html, boolean anonymized) {
+        if(anonymized && (format != Format.Internal)) {
+            //Only Internal format supports anonymization
+            return null;
+        }
+        switch (format) {
+        case BibTeX:
+            return toBibtexString();
+        case CSL:
+            return JsonUtil.prettyPrint(getCSLJsonFormat());
+        case EndNote:
+            return toEndNoteString();
+        case Internal:
+            return formatInternalCitation(html, anonymized);
+        case RIS:
+            return toRISString();
+        }
+        return null;
+    }
+    
+    public static String getCitationFormatMediaType(Format format, boolean isHtml) {
+        switch (format) {
+        
+        case CSL:
+            return MediaType.APPLICATION_JSON;
+        case EndNote:
+            return MediaType.TEXT_XML;
+        case Internal:
+            return isHtml ? MediaType.TEXT_HTML : MediaType.TEXT_PLAIN;
+        }
+        return MediaType.TEXT_PLAIN;
+    }
+        
+    private String formatInternalCitation(boolean html, boolean anonymized) {
         // first add comma separated parts
         String separator = ", ";
         List<String> citationList = new ArrayList<>();
@@ -207,7 +283,7 @@ public class DataCitation {
 
         if (persistentId != null) {
         	// always show url format
-            citationList.add(formatURL(persistentId.toURL().toString(), persistentId.toURL().toString(), html)); 
+            citationList.add(formatURL(persistentId.asURL(), persistentId.asURL(), html)); 
         }
         citationList.add(formatString(publisher, html));
         citationList.add(version);
@@ -253,7 +329,7 @@ public class DataCitation {
     
     public void writeAsBibtexCitation(OutputStream os) throws IOException {
         // Use UTF-8
-        Writer out = new BufferedWriter(new OutputStreamWriter(os, "utf-8"));
+        Writer out = new BufferedWriter(new OutputStreamWriter(os, StandardCharsets.UTF_8));
         if(getFileTitle() !=null && isDirect()) {
             out.write("@incollection{");
         } else {
@@ -292,13 +368,15 @@ public class DataCitation {
         out.write("version = {");
         out.write(version);
         out.write("},\r\n");
-        out.write("doi = {");
-        out.write(persistentId.getAuthority());
-        out.write("/");
-        out.write(persistentId.getIdentifier());
-        out.write("},\r\n");
+        if("doi".equals(persistentId.getProtocol())) {
+            out.write("doi = {");
+            out.write(persistentId.getAuthority());
+            out.write("/");
+            out.write(persistentId.getIdentifier());
+            out.write("},\r\n");
+        }
         out.write("url = {");
-        out.write(persistentId.toURL().toString());
+        out.write(persistentId.asURL());
         out.write("}\r\n");
         out.write("}\r\n");
         out.flush();
@@ -317,7 +395,7 @@ public class DataCitation {
 
     public void writeAsRISCitation(OutputStream os) throws IOException {
         // Use UTF-8
-        Writer out = new BufferedWriter(new OutputStreamWriter(os, "utf-8"));
+        Writer out = new BufferedWriter(new OutputStreamWriter(os, StandardCharsets.UTF_8));
         out.write("Provider: " + publisher + "\r\n");
         out.write("Content: text/plain; charset=\"utf-8\"" + "\r\n");
         // Using type "DATA" - see https://github.com/IQSS/dataverse/issues/4816
@@ -330,8 +408,10 @@ public class DataCitation {
             out.write("TY  - DATA" + "\r\n");
             out.write("T1  - " + getTitle() + "\r\n");
         }
-        if (seriesTitle != null) {
-            out.write("T3  - " + seriesTitle + "\r\n");
+        if (seriesTitles != null) {
+            for (String seriesTitle : seriesTitles) {
+                out.write("T3  - " + seriesTitle + "\r\n");
+            }
         }
         /* Removing abstract/description per Request from G. King in #3759
         if(description!=null) {
@@ -387,7 +467,7 @@ public class DataCitation {
         
         out.write("SE  - " + date + "\r\n");
 
-        out.write("UR  - " + persistentId.toURL().toString() + "\r\n");
+        out.write("UR  - " + persistentId.asURL() + "\r\n");
         out.write("PB  - " + publisher + "\r\n");
 
         // a DataFile citation also includes filename und UNF, if applicable:
@@ -505,12 +585,22 @@ public class DataCitation {
         xmlw.writeCharacters(title);
         xmlw.writeEndElement(); // title
         }
-        
-        if (seriesTitle != null) {
-            xmlw.writeStartElement("tertiary-title");
-            xmlw.writeCharacters(seriesTitle);
+
+        /*
+        If I say just !"isEmpty" for series titles I get a failure 
+        on testToEndNoteString_withoutTitleAndAuthor
+        with a null pointer on build -SEK 3/31/23
+        */
+        if (seriesTitles != null && !seriesTitles.isEmpty() ) {
+            xmlw.writeStartElement("tertiary-titles");
+            for (String seriesTitle : seriesTitles){
+                xmlw.writeStartElement("tertiary-title");
+                xmlw.writeCharacters(seriesTitle);
+                xmlw.writeEndElement(); // tertiary-title
+            }
             xmlw.writeEndElement(); // tertiary-title
         }
+        
         xmlw.writeEndElement(); // titles
 
         xmlw.writeStartElement("section");
@@ -582,11 +672,21 @@ public class DataCitation {
         }
 
         xmlw.writeStartElement("urls");
-        xmlw.writeStartElement("related-urls");
-        xmlw.writeStartElement("url");
-        xmlw.writeCharacters(getPersistentId().toURL().toString());
-        xmlw.writeEndElement(); // url
-        xmlw.writeEndElement(); // related-urls
+        if (persistentId != null) {
+            if (PERMA_PROTOCOL.equals(persistentId.getProtocol()) || HDL_PROTOCOL.equals(persistentId.getProtocol())) {
+                xmlw.writeStartElement("web-urls");
+                xmlw.writeStartElement("url");
+                xmlw.writeCharacters(getPersistentId().asURL());
+                xmlw.writeEndElement(); // url
+                xmlw.writeEndElement(); // web-urls
+            } else if (DOI_PROTOCOL.equals(persistentId.getProtocol())) {
+                xmlw.writeStartElement("related-urls");
+                xmlw.writeStartElement("url");
+                xmlw.writeCharacters(getPersistentId().asURL());
+                xmlw.writeEndElement(); // url
+                xmlw.writeEndElement(); // related-urls
+            }
+        }
         xmlw.writeEndElement(); // urls
         
         // a DataFile citation also includes the filename and (for Tabular
@@ -604,10 +704,9 @@ public class DataCitation {
                     xmlw.writeEndElement(); // custom2
             }
         }
-        if (persistentId != null) {
+        if (persistentId != null && "doi".equals(persistentId.getProtocol())) {
             xmlw.writeStartElement("electronic-resource-num");
-            String electResourceNum = persistentId.getProtocol() + "/" + persistentId.getAuthority() + "/"
-                    + persistentId.getIdentifier();
+            String electResourceNum = persistentId.asRawIdentifier();
             xmlw.writeCharacters(electResourceNum);
             xmlw.writeEndElement();
         }
@@ -624,12 +723,12 @@ public class DataCitation {
         String authorString = getAuthorsString();
 
         if (authorString.isEmpty()) {
-            authorString = AbstractGlobalIdServiceBean.UNAVAILABLE;
+            authorString = AbstractPidProvider.UNAVAILABLE;
     }
         String producerString = getPublisher();
 
         if (producerString.isEmpty()) {
-            producerString =  AbstractGlobalIdServiceBean.UNAVAILABLE;
+            producerString =  AbstractPidProvider.UNAVAILABLE;
         }
 
         metadata.put("datacite.creator", authorString);
@@ -637,9 +736,30 @@ public class DataCitation {
         metadata.put("datacite.publisher", producerString);
         metadata.put("datacite.publicationyear", getYear());
         return metadata;
-	}
+    }
 
-	
+    public JsonObject getCSLJsonFormat() {
+        CSLItemDataBuilder itemBuilder = new CSLItemDataBuilder();
+        if (type.equals(DatasetType.DATASET_TYPE_SOFTWARE)) {
+            itemBuilder.type(CSLType.SOFTWARE);
+        } else {
+            itemBuilder.type(CSLType.DATASET);
+        }
+        itemBuilder.title(formatString(title,true)).author((CSLName[]) cslAuthors.toArray(new CSLName[0])).issued(Integer.parseInt(year));
+        if (seriesTitles != null) {
+            itemBuilder.containerTitle(formatString(seriesTitles.get(0), true));
+        }
+        itemBuilder.version(version).DOI(persistentId.asString());
+        if (keywords != null) {
+            itemBuilder
+                    .categories(keywords.stream().map(keyword -> formatString(keyword, true)).toArray(String[]::new));
+        }
+        itemBuilder.abstrct(formatString(description, true)).publisher(formatString(publisher, true))
+                .URL(SystemConfig.getDataverseSiteUrlStatic() + "/citation?persistentId=" + persistentId.asString());
+        JsonBuilder b = (new StringJsonBuilderFactory()).createJsonBuilder();
+        return JsonUtil.getJsonObject((String) itemBuilder.build().toJson(b));
+    }
+
     // helper methods   
     private String formatString(String value, boolean escapeHtml) {
         return formatString(value, escapeHtml, "");
@@ -746,6 +866,20 @@ public class DataCitation {
             if (!author.isEmpty()) {
                 String an = author.getName().getDisplayValue().trim();
                 authors.add(an);
+                boolean isOrg = "ROR".equals(author.getIdType());
+                JsonObject authorJson = PersonOrOrgUtil.getPersonOrOrganization(an, false, !isOrg);
+                if (!authorJson.getBoolean("isPerson")) {
+                    cslAuthors.add(new CSLNameBuilder().literal(formatString(authorJson.getString("fullName"), true)).isInstitution(true).build());
+                } else {
+                    if (authorJson.containsKey("givenName") && authorJson.containsKey("familyName")) {
+                        String givenName = formatString(authorJson.getString("givenName"),true);
+                        String familyName = formatString(authorJson.getString("familyName"), true);
+                        cslAuthors.add(new CSLNameBuilder().given(givenName).family(familyName).isInstitution(false).build());
+                    } else {
+                        cslAuthors.add(
+                                new CSLNameBuilder().literal(formatString(authorJson.getString("fullName"), true)).isInstitution(false).build());
+                    }
+                }
             }
         });
         producers = dsv.getDatasetProducerNames();
@@ -779,20 +913,16 @@ public class DataCitation {
         if (!dsv.getDataset().isHarvested()
                 || HarvestingClient.HARVEST_STYLE_VDC.equals(dsv.getDataset().getHarvestedFrom().getHarvestStyle())
                 || HarvestingClient.HARVEST_STYLE_ICPSR.equals(dsv.getDataset().getHarvestedFrom().getHarvestStyle())
+                || HarvestingClient.HARVEST_STYLE_DEFAULT.equals(dsv.getDataset().getHarvestedFrom().getHarvestStyle())
                 || HarvestingClient.HARVEST_STYLE_DATAVERSE
                         .equals(dsv.getDataset().getHarvestedFrom().getHarvestStyle())) {
-                // creating a global id like this:
-                // persistentId = new GlobalId(dv.getGlobalId());
-                // you end up doing new GlobalId((New GlobalId(dv)).toString())
-                // - doing an extra formatting-and-parsing-again
-                // This achieves the same thing:
                 if(!isDirect()) {
                 if (!StringUtils.isEmpty(dsv.getDataset().getIdentifier())) {
-                    return new GlobalId(dsv.getDataset());
+                    return dsv.getDataset().getGlobalId();
                 }
                 } else {
                 if (!StringUtils.isEmpty(dv.getIdentifier())) {
-                    return new GlobalId(dv);
+                    return dv.getGlobalId();
                 }
             }
         }

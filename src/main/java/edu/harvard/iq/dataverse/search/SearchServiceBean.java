@@ -1,14 +1,7 @@
 package edu.harvard.iq.dataverse.search;
 
-import edu.harvard.iq.dataverse.DataFile;
-import edu.harvard.iq.dataverse.DatasetFieldConstant;
-import edu.harvard.iq.dataverse.DatasetFieldServiceBean;
-import edu.harvard.iq.dataverse.DatasetFieldType;
-import edu.harvard.iq.dataverse.DatasetVersionServiceBean;
-import edu.harvard.iq.dataverse.Dataverse;
-import edu.harvard.iq.dataverse.DataverseFacet;
-import edu.harvard.iq.dataverse.DataverseMetadataBlockFacet;
-import edu.harvard.iq.dataverse.DvObjectServiceBean;
+import edu.harvard.iq.dataverse.*;
+import edu.harvard.iq.dataverse.authorization.Permission;
 import edu.harvard.iq.dataverse.authorization.groups.Group;
 import edu.harvard.iq.dataverse.authorization.groups.GroupServiceBean;
 import edu.harvard.iq.dataverse.authorization.users.AuthenticatedUser;
@@ -16,16 +9,17 @@ import edu.harvard.iq.dataverse.authorization.users.GuestUser;
 import edu.harvard.iq.dataverse.authorization.users.PrivateUrlUser;
 import edu.harvard.iq.dataverse.authorization.users.User;
 import edu.harvard.iq.dataverse.engine.command.DataverseRequest;
+import edu.harvard.iq.dataverse.settings.FeatureFlags;
 import edu.harvard.iq.dataverse.util.BundleUtil;
 import edu.harvard.iq.dataverse.util.SystemConfig;
 import java.io.IOException;
 import java.lang.reflect.Field;
-import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
@@ -36,16 +30,19 @@ import java.util.Set;
 import java.util.MissingResourceException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import javax.ejb.EJB;
-import javax.ejb.EJBTransactionRolledbackException;
-import javax.ejb.Stateless;
-import javax.ejb.TransactionRolledbackLocalException;
-import javax.inject.Named;
-import javax.persistence.NoResultException;
+import jakarta.ejb.EJB;
+import jakarta.ejb.EJBTransactionRolledbackException;
+import jakarta.ejb.Stateless;
+import jakarta.ejb.TransactionRolledbackLocalException;
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+import jakarta.persistence.NoResultException;
+
+import org.apache.commons.lang3.StringUtils;
 import org.apache.solr.client.solrj.SolrQuery;
 import org.apache.solr.client.solrj.SolrQuery.SortClause;
 import org.apache.solr.client.solrj.SolrServerException;
-import org.apache.solr.client.solrj.impl.HttpSolrClient.RemoteSolrException;
+import org.apache.solr.client.solrj.impl.BaseHttpSolrClient.RemoteSolrException;
 import org.apache.solr.client.solrj.response.FacetField;
 import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.client.solrj.response.RangeFacet;
@@ -58,6 +55,8 @@ import org.apache.solr.common.SolrDocumentList;
 public class SearchServiceBean {
 
     private static final Logger logger = Logger.getLogger(SearchServiceBean.class.getCanonicalName());
+
+    private static final String ALL_GROUPS = "*";
 
     /**
      * We're trying to make the SearchServiceBean lean, mean, and fast, with as
@@ -78,6 +77,10 @@ public class SearchServiceBean {
     SystemConfig systemConfig;
     @EJB
     SolrClientService solrClientService;
+    @EJB
+    PermissionServiceBean permissionService;
+    @Inject
+    ThumbnailServiceWrapper thumbnailServiceWrapper;
     
     /**
      * Import note: "onlyDatatRelatedToMe" relies on filterQueries for providing
@@ -102,7 +105,7 @@ public class SearchServiceBean {
     public SolrQueryResponse search(DataverseRequest dataverseRequest, List<Dataverse> dataverses, String query, List<String> filterQueries, String sortField, String sortOrder, int paginationStart, boolean onlyDatatRelatedToMe, int numResultsPerPage) throws SearchException {
         return search(dataverseRequest, dataverses, query, filterQueries, sortField, sortOrder, paginationStart, onlyDatatRelatedToMe, numResultsPerPage, true, null, null);
     }
-
+    
     /**
      * Import note: "onlyDatatRelatedToMe" relies on filterQueries for providing
      * access to Private Data for the correct user
@@ -123,6 +126,41 @@ public class SearchServiceBean {
      * @param retrieveEntities - look up dvobject entities with .find() (potentially expensive!)
      * @param geoPoint e.g. "35,15"
      * @param geoRadius e.g. "5"
+
+     * @return
+     * @throws SearchException
+     */
+    public SolrQueryResponse search(
+            DataverseRequest dataverseRequest, 
+            List<Dataverse> dataverses, 
+            String query, 
+            List<String> filterQueries, 
+            String sortField, 
+            String sortOrder, 
+            int paginationStart, 
+            boolean onlyDatatRelatedToMe, 
+            int numResultsPerPage,
+            boolean retrieveEntities,
+            String geoPoint,
+            String geoRadius) throws SearchException {
+        return search(dataverseRequest, dataverses, query, filterQueries, sortField, sortOrder, paginationStart, onlyDatatRelatedToMe, numResultsPerPage, true, null, null, true, true);
+    }
+
+    /**
+     * @param dataverseRequest
+     * @param dataverses
+     * @param query
+     * @param filterQueries
+     * @param sortField
+     * @param sortOrder
+     * @param paginationStart
+     * @param onlyDatatRelatedToMe
+     * @param numResultsPerPage
+     * @param retrieveEntities - look up dvobject entities with .find() (potentially expensive!)
+     * @param geoPoint e.g. "35,15"
+     * @param geoRadius e.g. "5"
+     * @param addFacets boolean
+     * @param addHighlights boolean
      * @return
      * @throws SearchException
      */
@@ -131,13 +169,16 @@ public class SearchServiceBean {
             List<Dataverse> dataverses,
             String query,
             List<String> filterQueries,
-            String sortField, String sortOrder,
+            String sortField, 
+            String sortOrder,
             int paginationStart,
             boolean onlyDatatRelatedToMe,
             int numResultsPerPage,
             boolean retrieveEntities,
             String geoPoint,
-            String geoRadius
+            String geoRadius,
+            boolean addFacets,
+            boolean addHighlights
     ) throws SearchException {
 
         if (paginationStart < 0) {
@@ -149,72 +190,24 @@ public class SearchServiceBean {
 
         SolrQuery solrQuery = new SolrQuery();
         query = SearchUtil.sanitizeQuery(query);
-        solrQuery.setQuery(query);
-//        SortClause foo = new SortClause("name", SolrQuery.ORDER.desc);
-//        if (query.equals("*") || query.equals("*:*")) {
-//            solrQuery.setSort(new SortClause(SearchFields.NAME_SORT, SolrQuery.ORDER.asc));
-        solrQuery.setSort(new SortClause(sortField, sortOrder));
-//        } else {
-//            solrQuery.setSort(sortClause);
-//        }
-//        solrQuery.setSort(sortClause);
-        solrQuery.setHighlight(true).setHighlightSnippets(1);
-        Integer fragSize = systemConfig.getSearchHighlightFragmentSize();
-        if (fragSize != null) {
-            solrQuery.setHighlightFragsize(fragSize);
-        }
-        solrQuery.setHighlightSimplePre("<span class=\"search-term-match\">");
-        solrQuery.setHighlightSimplePost("</span>");
-        Map<String, String> solrFieldsToHightlightOnMap = new HashMap<>();
-        // TODO: Do not hard code "Name" etc as English here.
-        solrFieldsToHightlightOnMap.put(SearchFields.NAME, "Name");
-        solrFieldsToHightlightOnMap.put(SearchFields.AFFILIATION, "Affiliation");
-        solrFieldsToHightlightOnMap.put(SearchFields.FILE_TYPE_FRIENDLY, "File Type");
-        solrFieldsToHightlightOnMap.put(SearchFields.DESCRIPTION, "Description");
-        solrFieldsToHightlightOnMap.put(SearchFields.VARIABLE_NAME, "Variable Name");
-        solrFieldsToHightlightOnMap.put(SearchFields.VARIABLE_LABEL, "Variable Label");
-        solrFieldsToHightlightOnMap.put(SearchFields.LITERAL_QUESTION, BundleUtil.getStringFromBundle("search.datasets.literalquestion"));
-        solrFieldsToHightlightOnMap.put(SearchFields.INTERVIEW_INSTRUCTIONS, BundleUtil.getStringFromBundle("search.datasets.interviewinstructions"));
-        solrFieldsToHightlightOnMap.put(SearchFields.POST_QUESTION, BundleUtil.getStringFromBundle("search.datasets.postquestion"));
-        solrFieldsToHightlightOnMap.put(SearchFields.VARIABLE_UNIVERSE, BundleUtil.getStringFromBundle("search.datasets.variableuniverse"));
-        solrFieldsToHightlightOnMap.put(SearchFields.VARIABLE_NOTES, BundleUtil.getStringFromBundle("search.datasets.variableNotes"));
 
-        solrFieldsToHightlightOnMap.put(SearchFields.FILE_TYPE_SEARCHABLE, "File Type");
-        solrFieldsToHightlightOnMap.put(SearchFields.DATASET_PUBLICATION_DATE, "Publication Year");
-        solrFieldsToHightlightOnMap.put(SearchFields.DATASET_PERSISTENT_ID, BundleUtil.getStringFromBundle("advanced.search.datasets.persistentId"));
-        solrFieldsToHightlightOnMap.put(SearchFields.FILE_PERSISTENT_ID, BundleUtil.getStringFromBundle("advanced.search.files.persistentId"));
-        /**
-         * @todo Dataverse subject and affiliation should be highlighted but
-         * this is commented out right now because the "friendly" names are not
-         * being shown on the dataverse cards. See also
-         * https://github.com/IQSS/dataverse/issues/1431
-         */
-//        solrFieldsToHightlightOnMap.put(SearchFields.DATAVERSE_SUBJECT, "Subject");
-//        solrFieldsToHightlightOnMap.put(SearchFields.DATAVERSE_AFFILIATION, "Affiliation");
-        /**
-         * @todo: show highlight on file card?
-         * https://redmine.hmdc.harvard.edu/issues/3848
-         */
-        solrFieldsToHightlightOnMap.put(SearchFields.FILENAME_WITHOUT_EXTENSION, "Filename Without Extension");
-        solrFieldsToHightlightOnMap.put(SearchFields.FILE_TAG_SEARCHABLE, "File Tag");
-        List<DatasetFieldType> datasetFields = datasetFieldService.findAllOrderedById();
-        for (DatasetFieldType datasetFieldType : datasetFields) {
-            String solrField = datasetFieldType.getSolrField().getNameSearchable();
-            String displayName = datasetFieldType.getDisplayName();
-            solrFieldsToHightlightOnMap.put(solrField, displayName);
+        solrQuery.setQuery(query);
+        if (sortField != null) {
+            // is it ok not to specify any sort? - there are cases where we 
+            // don't care, and it must cost some extra cycles -- L.A.
+            solrQuery.setSort(new SortClause(sortField, sortOrder));
         }
-        for (Map.Entry<String, String> entry : solrFieldsToHightlightOnMap.entrySet()) {
-            String solrField = entry.getKey();
-            // String displayName = entry.getValue();
-            solrQuery.addHighlightField(solrField);
-        }
+        
         solrQuery.setParam("fl", "*,score");
         solrQuery.setParam("qt", "/select");
         solrQuery.setParam("facet", "true");
+        
         /**
          * @todo: do we need facet.query?
          */
         solrQuery.setParam("facet.query", "*");
+        solrQuery.addFacetField(SearchFields.TYPE); // this one is always performed
+
         for (String filterQuery : filterQueries) {
             solrQuery.addFilterQuery(filterQuery);
         }
@@ -224,70 +217,133 @@ public class SearchServiceBean {
             // See https://solr.apache.org/guide/8_11/spatial-search.html#bbox
             solrQuery.addFilterQuery("{!bbox sfield=" + SearchFields.GEOLOCATION + "}");
         }
-
-        // -----------------------------------
-        // Facets to Retrieve
-        // -----------------------------------
-        solrQuery.addFacetField(SearchFields.METADATA_TYPES);
-//        solrQuery.addFacetField(SearchFields.HOST_DATAVERSE);
-//        solrQuery.addFacetField(SearchFields.AUTHOR_STRING);
-        solrQuery.addFacetField(SearchFields.DATAVERSE_CATEGORY);
-        solrQuery.addFacetField(SearchFields.METADATA_SOURCE);
-//        solrQuery.addFacetField(SearchFields.AFFILIATION);
-        solrQuery.addFacetField(SearchFields.PUBLICATION_YEAR);
-//        solrQuery.addFacetField(SearchFields.CATEGORY);
-//        solrQuery.addFacetField(SearchFields.FILE_TYPE_MIME);
-//        solrQuery.addFacetField(SearchFields.DISTRIBUTOR);
-//        solrQuery.addFacetField(SearchFields.KEYWORD);
-        /**
-         * @todo when a new method on datasetFieldService is available
-         * (retrieveFacetsByDataverse?) only show the facets that the dataverse
-         * in question wants to show (and in the right order):
-         * https://redmine.hmdc.harvard.edu/issues/3490
-         *
-         * also, findAll only returns advancedSearchField = true... we should
-         * probably introduce the "isFacetable" boolean rather than caring about
-         * if advancedSearchField is true or false
-         *
-         */
-
+        
         List<DataverseMetadataBlockFacet> metadataBlockFacets = new LinkedList<>();
-        //I'm not sure if just adding null here is good for hte permissions system... i think it needs something
-        if(dataverses != null) {
-            for(Dataverse dataverse : dataverses) {
-                // -----------------------------------
-                // PERMISSION FILTER QUERY
-                // -----------------------------------
-                String permissionFilterQuery = this.getPermissionFilterQuery(dataverseRequest, solrQuery, dataverse, onlyDatatRelatedToMe);
-                if (permissionFilterQuery != null) {
-                    solrQuery.addFilterQuery(permissionFilterQuery);
-                }
-                if (dataverse != null) {
-                    for (DataverseFacet dataverseFacet : dataverse.getDataverseFacets()) {
-                        DatasetFieldType datasetField = dataverseFacet.getDatasetFieldType();
-                        solrQuery.addFacetField(datasetField.getSolrField().getNameFacetable());
+
+        if (addFacets) {
+
+            
+
+            // -----------------------------------
+            // Facets to Retrieve
+            // -----------------------------------
+            solrQuery.addFacetField(SearchFields.METADATA_TYPES);
+            solrQuery.addFacetField(SearchFields.DATASET_TYPE);
+            solrQuery.addFacetField(SearchFields.DATAVERSE_CATEGORY);
+            solrQuery.addFacetField(SearchFields.METADATA_SOURCE);
+            solrQuery.addFacetField(SearchFields.PUBLICATION_YEAR);
+            /*
+            * We talked about this in slack on 2021-09-14, Users can see objects on draft/unpublished 
+            *  if the owner gives permissions to all users so it makes sense to expose this facet 
+            *  to all users. The request of this change started because the order of the facets were 
+            *  changed with the PR #9635 and this was unintended.
+            */
+            solrQuery.addFacetField(SearchFields.PUBLICATION_STATUS);
+            solrQuery.addFacetField(SearchFields.DATASET_LICENSE);
+            /**
+             * @todo when a new method on datasetFieldService is available
+             * (retrieveFacetsByDataverse?) only show the facets that the
+             * dataverse in question wants to show (and in the right order):
+             * https://redmine.hmdc.harvard.edu/issues/3490
+             *
+             * also, findAll only returns advancedSearchField = true... we
+             * should probably introduce the "isFacetable" boolean rather than
+             * caring about if advancedSearchField is true or false
+             *
+             */
+
+            if (dataverses != null) {
+                for (Dataverse dataverse : dataverses) {
+                    if (dataverse != null) {
+                        for (DataverseFacet dataverseFacet : dataverse.getDataverseFacets()) {
+                            DatasetFieldType datasetField = dataverseFacet.getDatasetFieldType();
+                            solrQuery.addFacetField(datasetField.getSolrField().getNameFacetable());
+                        }
+
+                        // Get all metadata block facets configured to be displayed
+                        metadataBlockFacets.addAll(dataverse.getMetadataBlockFacets());
                     }
-                    // Get all metadata block facets configured to be displayed
-                    metadataBlockFacets.addAll(dataverse.getMetadataBlockFacets());
                 }
             }
-        } else {
-            String permissionFilterQuery = this.getPermissionFilterQuery(dataverseRequest, solrQuery, null, onlyDatatRelatedToMe);
-            if (permissionFilterQuery != null) {
-                solrQuery.addFilterQuery(permissionFilterQuery);
+            
+            solrQuery.addFacetField(SearchFields.FILE_TYPE);
+            /**
+            * @todo: hide the extra line this shows in the GUI... at least it's
+            * last...
+            */
+            solrQuery.addFacetField(SearchFields.FILE_TAG);
+            if (!systemConfig.isPublicInstall()) {
+                solrQuery.addFacetField(SearchFields.ACCESS);
             }
         }
 
-        solrQuery.addFacetField(SearchFields.FILE_TYPE);
-        /**
-         * @todo: hide the extra line this shows in the GUI... at least it's
-         * last...
-         */
-        solrQuery.addFacetField(SearchFields.TYPE);
-        solrQuery.addFacetField(SearchFields.FILE_TAG);
-        if (!systemConfig.isPublicInstall()) {
-            solrQuery.addFacetField(SearchFields.ACCESS);
+        List<DatasetFieldType> datasetFields = datasetFieldService.findAllOrderedById();
+        Map<String, String> solrFieldsToHightlightOnMap = new HashMap<>();
+        if (addHighlights) {
+            solrQuery.setHighlight(true).setHighlightSnippets(1).setHighlightRequireFieldMatch(true);
+            Integer fragSize = systemConfig.getSearchHighlightFragmentSize();
+            if (fragSize != null) {
+                solrQuery.setHighlightFragsize(fragSize);
+            }
+            solrQuery.setHighlightSimplePre("<span class=\"search-term-match\">");
+            solrQuery.setHighlightSimplePost("</span>");
+
+            // TODO: Do not hard code "Name" etc as English here.
+            solrFieldsToHightlightOnMap.put(SearchFields.NAME, "Name");
+            solrFieldsToHightlightOnMap.put(SearchFields.AFFILIATION, "Affiliation");
+            solrFieldsToHightlightOnMap.put(SearchFields.FILE_TYPE_FRIENDLY, "File Type");
+            solrFieldsToHightlightOnMap.put(SearchFields.DESCRIPTION, "Description");
+            solrFieldsToHightlightOnMap.put(SearchFields.VARIABLE_NAME, "Variable Name");
+            solrFieldsToHightlightOnMap.put(SearchFields.VARIABLE_LABEL, "Variable Label");
+            solrFieldsToHightlightOnMap.put(SearchFields.LITERAL_QUESTION, BundleUtil.getStringFromBundle("search.datasets.literalquestion"));
+            solrFieldsToHightlightOnMap.put(SearchFields.INTERVIEW_INSTRUCTIONS, BundleUtil.getStringFromBundle("search.datasets.interviewinstructions"));
+            solrFieldsToHightlightOnMap.put(SearchFields.POST_QUESTION, BundleUtil.getStringFromBundle("search.datasets.postquestion"));
+            solrFieldsToHightlightOnMap.put(SearchFields.VARIABLE_UNIVERSE, BundleUtil.getStringFromBundle("search.datasets.variableuniverse"));
+            solrFieldsToHightlightOnMap.put(SearchFields.VARIABLE_NOTES, BundleUtil.getStringFromBundle("search.datasets.variableNotes"));
+
+            solrFieldsToHightlightOnMap.put(SearchFields.FILE_TYPE_SEARCHABLE, "File Type");
+            solrFieldsToHightlightOnMap.put(SearchFields.DATASET_PUBLICATION_DATE, "Publication Year");
+            solrFieldsToHightlightOnMap.put(SearchFields.DATASET_PERSISTENT_ID, BundleUtil.getStringFromBundle("advanced.search.datasets.persistentId"));
+            solrFieldsToHightlightOnMap.put(SearchFields.FILE_PERSISTENT_ID, BundleUtil.getStringFromBundle("advanced.search.files.persistentId"));
+            /**
+             * @todo Dataverse subject and affiliation should be highlighted but
+             * this is commented out right now because the "friendly" names are
+             * not being shown on the dataverse cards. See also
+             * https://github.com/IQSS/dataverse/issues/1431
+             */
+//        solrFieldsToHightlightOnMap.put(SearchFields.DATAVERSE_SUBJECT, "Subject");
+//        solrFieldsToHightlightOnMap.put(SearchFields.DATAVERSE_AFFILIATION, "Affiliation");
+            /**
+             * @todo: show highlight on file card?
+             * https://redmine.hmdc.harvard.edu/issues/3848
+             */
+            solrFieldsToHightlightOnMap.put(SearchFields.FILENAME_WITHOUT_EXTENSION, "Filename Without Extension");
+            solrFieldsToHightlightOnMap.put(SearchFields.FILE_TAG_SEARCHABLE, "File Tag");
+
+            for (DatasetFieldType datasetFieldType : datasetFields) {
+                String solrField = datasetFieldType.getSolrField().getNameSearchable();
+                String displayName = datasetFieldType.getDisplayName();
+                solrFieldsToHightlightOnMap.put(solrField, displayName);
+            }
+            for (Map.Entry<String, String> entry : solrFieldsToHightlightOnMap.entrySet()) {
+                String solrField = entry.getKey();
+                // String displayName = entry.getValue();
+                solrQuery.addHighlightField(solrField);
+            }
         }
+
+        // -----------------------------------
+        // PERMISSION FILTER QUERY
+        // -----------------------------------
+        String permissionFilterQuery = getPermissionFilterQuery(dataverseRequest, solrQuery, onlyDatatRelatedToMe, addFacets);
+        if (!permissionFilterQuery.isEmpty()) {
+            String[] filterParts = permissionFilterQuery.split("&q1=");
+            solrQuery.addFilterQuery(filterParts[0]);
+            if(filterParts.length > 1 ) {
+                solrQuery.add("q1", filterParts[1]);
+            }
+        }
+        
         /**
          * @todo: do sanity checking... throw error if negative
          */
@@ -329,10 +385,32 @@ public class SearchServiceBean {
         // Make the solr query
         // -----------------------------------
         QueryResponse queryResponse = null;
+        
         try {
             queryResponse = solrClientService.getSolrClient().query(solrQuery);
+
         } catch (RemoteSolrException ex) {
             String messageFromSolr = ex.getLocalizedMessage();
+            
+            logger.fine("message from the solr exception: "+messageFromSolr+"; code: "+ex.code());
+            
+            SolrQueryResponse exceptionSolrQueryResponse = new SolrQueryResponse(solrQuery);
+
+            // We probably shouldn't be assuming that this is necessarily a 
+            // "search syntax error", as the code below implies - could be 
+            // something else too - ? 
+            
+            // Specifically, we now rely on the Solr "circuit breaker" mechanism
+            // to start dropping requests with 503, when the service is 
+            // overwhelmed with requests load (with the assumption that this is
+            // a transient condition): 
+            
+            if (ex.code() == 503) {
+                // actual logic for communicating this state back to the local 
+                // client code TBD (@todo)
+                exceptionSolrQueryResponse.setSolrTemporarilyUnavailable(true);
+            }
+            
             String error = "Search Syntax Error: ";
             String stringToHide = "org.apache.solr.search.SyntaxError: ";
             if (messageFromSolr.startsWith(stringToHide)) {
@@ -342,10 +420,10 @@ public class SearchServiceBean {
                 error += messageFromSolr;
             }
             logger.info(error);
-            SolrQueryResponse exceptionSolrQueryResponse = new SolrQueryResponse(solrQuery);
             exceptionSolrQueryResponse.setError(error);
 
             // we can't show anything because of the search syntax error
+                        
             long zeroNumResultsFound = 0;
             long zeroGetResultsStart = 0;
             List<SolrSearchResult> emptySolrSearchResults = new ArrayList<>();
@@ -361,6 +439,12 @@ public class SearchServiceBean {
         } catch (SolrServerException | IOException ex) {
             throw new SearchException("Internal Dataverse Search Engine Error", ex);
         }
+        
+        int statusCode = queryResponse.getStatus();
+        
+        logger.fine("status code of the query response: "+statusCode);
+        logger.fine("_size from query response: "+queryResponse._size());
+        logger.fine("qtime: "+queryResponse.getQTime());
 
         SolrDocumentList docs = queryResponse.getResults();
         List<SolrSearchResult> solrSearchResults = new ArrayList<>();
@@ -398,6 +482,7 @@ public class SearchServiceBean {
             String identifier = (String) solrDocument.getFieldValue(SearchFields.IDENTIFIER);
             String citation = (String) solrDocument.getFieldValue(SearchFields.DATASET_CITATION);
             String citationPlainHtml = (String) solrDocument.getFieldValue(SearchFields.DATASET_CITATION_HTML);
+            String datasetType = (String) solrDocument.getFieldValue(SearchFields.DATASET_TYPE);
             String persistentUrl = (String) solrDocument.getFieldValue(SearchFields.PERSISTENT_URL);
             String name = (String) solrDocument.getFieldValue(SearchFields.NAME);
             String nameSort = (String) solrDocument.getFieldValue(SearchFields.NAME_SORT);
@@ -413,37 +498,54 @@ public class SearchServiceBean {
             String dvTree = (String) solrDocument.getFirstValue(SearchFields.SUBTREE);
             String identifierOfDataverse = (String) solrDocument.getFieldValue(SearchFields.IDENTIFIER_OF_DATAVERSE);
             String nameOfDataverse = (String) solrDocument.getFieldValue(SearchFields.DATAVERSE_NAME);
+            String dataverseAffiliation = (String) solrDocument.getFieldValue(SearchFields.DATAVERSE_AFFILIATION);
+            String dataverseParentAlias = (String) solrDocument.getFieldValue(SearchFields.DATAVERSE_PARENT_ALIAS);
+            String dataverseParentName = (String) solrDocument.getFieldValue(SearchFields.PARENT_NAME);
             Long embargoEndDate = (Long) solrDocument.getFieldValue(SearchFields.EMBARGO_END_DATE);
+            Long retentionEndDate = (Long) solrDocument.getFieldValue(SearchFields.RETENTION_END_DATE);
+            //
+            Boolean datasetValid = (Boolean) solrDocument.getFieldValue(SearchFields.DATASET_VALID);
+            Long fileCount = (Long) solrDocument.getFieldValue(SearchFields.FILE_COUNT);
             
             List<String> matchedFields = new ArrayList<>();
-            List<Highlight> highlights = new ArrayList<>();
-            Map<SolrField, Highlight> highlightsMap = new HashMap<>();
-            Map<SolrField, List<String>> highlightsMap2 = new HashMap<>();
-            Map<String, Highlight> highlightsMap3 = new HashMap<>();
-            if (queryResponse.getHighlighting().get(id) != null) {
-                for (Map.Entry<String, String> entry : solrFieldsToHightlightOnMap.entrySet()) {
-                    String field = entry.getKey();
-                    String displayName = entry.getValue();
+            
+            SolrSearchResult solrSearchResult = new SolrSearchResult(query, name);
+            
+            if (addHighlights) {
+                List<Highlight> highlights = new ArrayList<>();
+                Map<SolrField, Highlight> highlightsMap = new HashMap<>();
+                Map<SolrField, List<String>> highlightsMap2 = new HashMap<>();
+                Map<String, Highlight> highlightsMap3 = new HashMap<>();
+                if (queryResponse.getHighlighting().get(id) != null) {
+                    for (Map.Entry<String, String> entry : solrFieldsToHightlightOnMap.entrySet()) {
+                        String field = entry.getKey();
+                        String displayName = entry.getValue();
 
-                    List<String> highlightSnippets = queryResponse.getHighlighting().get(id).get(field);
-                    if (highlightSnippets != null) {
-                        matchedFields.add(field);
-                        /**
-                         * @todo only SolrField.SolrType.STRING? that's not
-                         * right... knit the SolrField object more into the
-                         * highlighting stuff
-                         */
-                        SolrField solrField = new SolrField(field, SolrField.SolrType.STRING, true, true);
-                        Highlight highlight = new Highlight(solrField, highlightSnippets, displayName);
-                        highlights.add(highlight);
-                        highlightsMap.put(solrField, highlight);
-                        highlightsMap2.put(solrField, highlightSnippets);
-                        highlightsMap3.put(field, highlight);
+                        List<String> highlightSnippets = queryResponse.getHighlighting().get(id).get(field);
+                        if (highlightSnippets != null) {
+                            matchedFields.add(field);
+                            /**
+                             * @todo only SolrField.SolrType.STRING? that's not
+                             * right... knit the SolrField object more into the
+                             * highlighting stuff
+                             */
+                            SolrField solrField = new SolrField(field, SolrField.SolrType.STRING, true, true);
+                            Highlight highlight = new Highlight(solrField, highlightSnippets, displayName);
+                            highlights.add(highlight);
+                            highlightsMap.put(solrField, highlight);
+                            highlightsMap2.put(solrField, highlightSnippets);
+                            highlightsMap3.put(field, highlight);
+                        }
                     }
+
                 }
 
+                solrSearchResult.setHighlightsAsList(highlights);
+                solrSearchResult.setHighlightsMap(highlightsMap);
+                solrSearchResult.setHighlightsAsMap(highlightsMap3);
             }
-            SolrSearchResult solrSearchResult = new SolrSearchResult(query, name);
+            
+            
             /**
              * @todo put all this in the constructor?
              */
@@ -470,32 +572,32 @@ public class SearchServiceBean {
             solrSearchResult.setNameSort(nameSort);
             solrSearchResult.setReleaseOrCreateDate(release_or_create_date);
             solrSearchResult.setMatchedFields(matchedFields);
-            solrSearchResult.setHighlightsAsList(highlights);
-            solrSearchResult.setHighlightsMap(highlightsMap);
-            solrSearchResult.setHighlightsAsMap(highlightsMap3);
+            
             Map<String, String> parent = new HashMap<>();
             String description = (String) solrDocument.getFieldValue(SearchFields.DESCRIPTION);
             solrSearchResult.setDescriptionNoSnippet(description);
             solrSearchResult.setDeaccessionReason(deaccessionReason);
             solrSearchResult.setDvTree(dvTree);
+            solrSearchResult.setDatasetValid(datasetValid);
+            solrSearchResult.setFileCount(fileCount);
 
-            String originSource = (String) solrDocument.getFieldValue(SearchFields.METADATA_SOURCE);
-            if (IndexServiceBean.HARVESTED.equals(originSource)) {
+            if (Boolean.TRUE.equals((Boolean) solrDocument.getFieldValue(SearchFields.IS_HARVESTED))) {
                 solrSearchResult.setHarvested(true);
             }
 
             solrSearchResult.setEmbargoEndDate(embargoEndDate);
-            
+            solrSearchResult.setRetentionEndDate(retentionEndDate);
+
             /**
              * @todo start using SearchConstants class here
              */
             if (type.equals("dataverses")) {
                 solrSearchResult.setName(name);
                 solrSearchResult.setHtmlUrl(baseUrl + SystemConfig.DATAVERSE_PATH + identifier);
-                // Do not set the ImageUrl, let the search include fragment fill in
-                // the thumbnail, similarly to how the dataset and datafile cards
-                // are handled.
-                //solrSearchResult.setImageUrl(baseUrl + "/api/access/dvCardImage/" + entityid);
+                solrSearchResult.setDataverseAffiliation(dataverseAffiliation);
+                solrSearchResult.setDataverseParentAlias(dataverseParentAlias);
+                solrSearchResult.setDataverseParentName(dataverseParentName);
+                solrSearchResult.setImageUrl(thumbnailServiceWrapper.getDataverseCardImageAsUrl(solrSearchResult));
                 /**
                  * @todo Expose this API URL after "dvs" is changed to
                  * "dataverses". Also, is an API token required for published
@@ -505,6 +607,7 @@ public class SearchServiceBean {
             } else if (type.equals("datasets")) {
                 solrSearchResult.setHtmlUrl(baseUrl + "/dataset.xhtml?globalId=" + identifier);
                 solrSearchResult.setApiUrl(baseUrl + "/api/datasets/" + entityid);
+                solrSearchResult.setImageUrl(thumbnailServiceWrapper.getDatasetCardImageAsUrl(solrSearchResult));
                 //Image url now set via thumbnail api
                 //solrSearchResult.setImageUrl(baseUrl + "/api/access/dsCardImage/" + datasetVersionId);
                 // No, we don't want to set the base64 thumbnails here.
@@ -521,7 +624,7 @@ public class SearchServiceBean {
                 if (datasetDescriptions != null) {
                     String firstDatasetDescription = datasetDescriptions.get(0);
                     if (firstDatasetDescription != null) {
-                        solrSearchResult.setDescriptionNoSnippet(firstDatasetDescription);
+                        solrSearchResult.setDescriptionNoSnippet(String.join(" ", datasetDescriptions));
                     }
                 }
                 solrSearchResult.setDatasetVersionId(datasetVersionId);
@@ -543,6 +646,7 @@ public class SearchServiceBean {
                 if (authors != null) {
                     solrSearchResult.setDatasetAuthors(authors);
                 }
+                solrSearchResult.setDatasetType(datasetType);
             } else if (type.equals("files")) {
                 String parentGlobalId = null;
                 Object parentGlobalIdObject = solrDocument.getFieldValue(SearchFields.PARENT_IDENTIFIER);
@@ -552,6 +656,7 @@ public class SearchServiceBean {
                 }
                 solrSearchResult.setHtmlUrl(baseUrl + "/dataset.xhtml?persistentId=" + parentGlobalId);
                 solrSearchResult.setDownloadUrl(baseUrl + "/api/access/datafile/" + entityid);
+                solrSearchResult.setImageUrl(thumbnailServiceWrapper.getFileCardImageAsUrl(solrSearchResult));
                 /**
                  * @todo We are not yet setting the API URL for files because
                  * not all files have metadata. Only subsettable files (those
@@ -580,6 +685,15 @@ public class SearchServiceBean {
                     logger.info("Exception setting setFileChecksumType: " + ex);
                 }
                 solrSearchResult.setFileChecksumValue((String) solrDocument.getFieldValue(SearchFields.FILE_CHECKSUM_VALUE));
+
+                if (solrDocument.getFieldValue(SearchFields.FILE_RESTRICTED) != null) {
+                    solrSearchResult.setFileRestricted((Boolean) solrDocument.getFieldValue(SearchFields.FILE_RESTRICTED));
+                }
+
+                if (solrSearchResult.getEntity() != null) {
+                    solrSearchResult.setCanDownloadFile(permissionService.hasPermissionsFor(dataverseRequest, solrSearchResult.getEntity(), EnumSet.of(Permission.DownloadFile)));
+                }
+
                 solrSearchResult.setUnf((String) solrDocument.getFieldValue(SearchFields.UNF));
                 solrSearchResult.setDatasetVersionId(datasetVersionId);
                 List<String> fileCategories = (List) solrDocument.getFieldValues(SearchFields.FILE_TAG);
@@ -591,6 +705,10 @@ public class SearchServiceBean {
                     Collections.sort(tabularDataTags);
                     solrSearchResult.setTabularDataTags(tabularDataTags);
                 }
+                Long observations = (Long) solrDocument.getFieldValue(SearchFields.OBSERVATIONS);
+                solrSearchResult.setObservations(observations);
+                Long tabCount = (Long) solrDocument.getFieldValue(SearchFields.VARIABLE_COUNT);
+                solrSearchResult.setTabularDataCount(tabCount);
                 String filePID = (String) solrDocument.getFieldValue(SearchFields.FILE_PERSISTENT_ID);
                 if(null != filePID && !"".equals(filePID) && !"".equals("null")) {
                     solrSearchResult.setFilePersistentId(filePID);
@@ -621,10 +739,14 @@ public class SearchServiceBean {
         boolean unpublishedAvailable = false;
         boolean deaccessionedAvailable = false;
         boolean hideMetadataSourceFacet = true;
+        boolean hideLicenseFacet = true;
+        boolean hideDatasetTypeFacet = true;
         for (FacetField facetField : queryResponse.getFacetFields()) {
             FacetCategory facetCategory = new FacetCategory();
             List<FacetLabel> facetLabelList = new ArrayList<>();
             int numMetadataSources = 0;
+            int numLicenses = 0;
+            int numDatasetTypes = 0;
             String metadataBlockName = "";
             String datasetFieldName = "";
             /**
@@ -650,23 +772,33 @@ public class SearchServiceBean {
 //                logger.info("field: " + facetField.getName() + " " + facetFieldCount.getName() + " (" + facetFieldCount.getCount() + ")");
                 String localefriendlyName = null;
                 if (facetFieldCount.getCount() > 0) {
-                   if(metadataBlockName.length() > 0 ) {
-                       localefriendlyName = getLocaleTitle(datasetFieldName,facetFieldCount.getName(), metadataBlockName);
+                    if(metadataBlockName.length() > 0 ) {
+                        localefriendlyName = getLocaleTitle(datasetFieldName,facetFieldCount.getName(), metadataBlockName);
                     } else if (facetField.getName().equals(SearchFields.METADATA_TYPES)) {
-                       Optional<DataverseMetadataBlockFacet> metadataBlockFacet = metadataBlockFacets.stream().filter(blockFacet -> blockFacet.getMetadataBlock().getName().equals(facetFieldCount.getName())).findFirst();
-                       if (metadataBlockFacet.isEmpty()) {
+                        Optional<DataverseMetadataBlockFacet> metadataBlockFacet = metadataBlockFacets.stream().filter(blockFacet -> blockFacet.getMetadataBlock().getName().equals(facetFieldCount.getName())).findFirst();
+                        if (metadataBlockFacet.isEmpty()) {
                            // metadata block facet is not configured to be displayed => ignore
                            continue;
-                       }
+                        }
 
-                       localefriendlyName = metadataBlockFacet.get().getMetadataBlock().getLocaleDisplayFacet();
-                   } else {
-                       try {
+                        localefriendlyName = metadataBlockFacet.get().getMetadataBlock().getLocaleDisplayFacet();
+                    } else if (facetField.getName().equals(SearchFields.DATASET_LICENSE)) {
+                        try {
+                            localefriendlyName = BundleUtil.getStringFromPropertyFile("license." + facetFieldCount.getName().toLowerCase().replace(" ","_") + ".name", "License");
+                        } catch (Exception e) {
+                            localefriendlyName = facetFieldCount.getName();
+                        }
+                    } else {
+                        try {
+                            // This is where facets are capitalized.
+                            // This will be a problem for the API clients because they get back a string like this from the Search API...
+                            // {"datasetType":{"friendly":"Dataset Type","labels":[{"Dataset":1},{"Software":1}]}
+                            // ... but they will need to use the lower case version (e.g. "software") to narrow results.
                            localefriendlyName = BundleUtil.getStringFromPropertyFile(facetFieldCount.getName(), "Bundle");
-                       } catch (Exception e) {
+                        } catch (Exception e) {
                            localefriendlyName = facetFieldCount.getName();
-                       }
-                   }
+                        }
+                    }
                     FacetLabel facetLabel = new FacetLabel(localefriendlyName, facetFieldCount.getCount());
                     // quote field facets
                     facetLabel.setFilterQuery(facetField.getName() + ":\"" + facetFieldCount.getName() + "\"");
@@ -679,14 +811,23 @@ public class SearchServiceBean {
                         } else if (facetFieldCount.getName().equals(IndexServiceBean.getDEACCESSIONED_STRING())) {
                             deaccessionedAvailable = true;
                         }
-                    }
-                    if (facetField.getName().equals(SearchFields.METADATA_SOURCE)) {
+                    } else if (facetField.getName().equals(SearchFields.METADATA_SOURCE)) {
                         numMetadataSources++;
+                    } else if (facetField.getName().equals(SearchFields.DATASET_LICENSE)) {
+                        numLicenses++;
+                    } else if (facetField.getName().equals(SearchFields.DATASET_TYPE)) {
+                        numDatasetTypes++;
                     }
                 }
             }
             if (numMetadataSources > 1) {
                 hideMetadataSourceFacet = false;
+            }
+            if (numLicenses > 1) {
+                hideLicenseFacet = false;
+            }
+            if (numDatasetTypes > 1 ) {
+                hideDatasetTypeFacet = false;
             }
             facetCategory.setName(facetField.getName());
             // hopefully people will never see the raw facetField.getName() because it may well have an _s at the end
@@ -762,6 +903,14 @@ public class SearchServiceBean {
                     }
                 } else if (facetCategory.getName().equals(SearchFields.METADATA_SOURCE)) {
                     if (!hideMetadataSourceFacet) {
+                        facetCategoryList.add(facetCategory);
+                    }
+                } else if (facetCategory.getName().equals(SearchFields.DATASET_LICENSE)) {
+                    if (!hideLicenseFacet) {
+                        facetCategoryList.add(facetCategory);
+                    }
+                } else if (facetCategory.getName().equals(SearchFields.DATASET_TYPE)) {
+                    if (!hideDatasetTypeFacet) {
                         facetCategoryList.add(facetCategory);
                     }
                 } else {
@@ -862,7 +1011,7 @@ public class SearchServiceBean {
      *
      * @return
      */
-    private String getPermissionFilterQuery(DataverseRequest dataverseRequest, SolrQuery solrQuery, Dataverse dataverse, boolean onlyDatatRelatedToMe) {
+    private String getPermissionFilterQuery(DataverseRequest dataverseRequest, SolrQuery solrQuery, boolean onlyDatatRelatedToMe, boolean addFacets) {
 
         User user = dataverseRequest.getUser();
         if (user == null) {
@@ -871,147 +1020,99 @@ public class SearchServiceBean {
         if (solrQuery == null) {
             throw new NullPointerException("solrQuery cannot be null");
         }
-        /**
-         * @todo For people who are not logged in, should we show stuff indexed
-         * with "AllUsers" group or not? If so, uncomment the allUsersString
-         * stuff below.
-         */
-//        String allUsersString = IndexServiceBean.getGroupPrefix() + AllUsers.get().getAlias();
-//        String publicOnly = "{!join from=" + SearchFields.DEFINITION_POINT + " to=id}" + SearchFields.DISCOVERABLE_BY + ":(" + IndexServiceBean.getPublicGroupString() + " OR " + allUsersString + ")";
-        String publicOnly = "{!join from=" + SearchFields.DEFINITION_POINT + " to=id}" + SearchFields.DISCOVERABLE_BY + ":(" + IndexServiceBean.getPublicGroupString() + ")";
-//        String publicOnly = "{!join from=" + SearchFields.GROUPS + " to=" + SearchFields.PERMS + "}id:" + IndexServiceBean.getPublicGroupString();
-        // initialize to public only to be safe
-        String dangerZoneNoSolrJoin = null;
-
+        
         if (user instanceof PrivateUrlUser) {
             user = GuestUser.get();
         }
 
-        // ----------------------------------------------------
-        // (1) Is this a GuestUser?
-        // Yes, see if GuestUser is part of any groups such as IP Groups.
-        // ----------------------------------------------------
-        if (user instanceof GuestUser) {
-            String groupsFromProviders = "";
-            Set<Group> groups = groupService.collectAncestors(groupService.groupsFor(dataverseRequest));
-            StringBuilder sb = new StringBuilder();
-            for (Group group : groups) {
-                logger.fine("found group " + group.getIdentifier() + " with alias " + group.getAlias());
-                String groupAlias = group.getAlias();
-                if (groupAlias != null && !groupAlias.isEmpty()) {
-                    sb.append(" OR ");
-                    // i.e. group_builtIn/all-users, ip/ipGroup3
-                    sb.append(IndexServiceBean.getGroupPrefix()).append(groupAlias);
+        ArrayList<String> groupList = new ArrayList<String>();
+        AuthenticatedUser au = null;
+        Set<Group> groups;
+
+        boolean avoidJoin = FeatureFlags.AVOID_EXPENSIVE_SOLR_JOIN.enabled();
+
+        if (user instanceof AuthenticatedUser) {
+            au = (AuthenticatedUser) user;
+
+            // ----------------------------------------------------
+            // Is this a Super User?
+            // If so, they can see everything
+            // ----------------------------------------------------
+            if (au.isSuperuser()) {
+                // Somewhat dangerous because this user (a superuser) will be able
+                // to see everything in Solr with no regard to permissions. But it's
+                // been this way since Dataverse 4.0. So relax. :)
+
+                return buildPermissionFilterQuery(avoidJoin, ALL_GROUPS);
+            }
+
+            // ----------------------------------------------------
+            // User is logged in AND onlyDatatRelatedToMe == true
+            // Yes, give back everything -> the settings will be in
+            // the filterqueries given to search
+            // ----------------------------------------------------
+            if (onlyDatatRelatedToMe == true) {
+                if (systemConfig.myDataDoesNotUsePermissionDocs()) {
+                    logger.fine("old 4.2 behavior: MyData is not using Solr permission docs");
+                    return buildPermissionFilterQuery(avoidJoin, ALL_GROUPS);
+                } else {
+                    // fall-through
+                    logger.fine("new post-4.2 behavior: MyData is using Solr permission docs");
                 }
             }
-            groupsFromProviders = sb.toString();
-            logger.fine("groupsFromProviders:" + groupsFromProviders);
-            String guestWithGroups = "{!join from=" + SearchFields.DEFINITION_POINT + " to=id}" + SearchFields.DISCOVERABLE_BY + ":(" + IndexServiceBean.getPublicGroupString() + groupsFromProviders + ")";
-            logger.fine(guestWithGroups);
-            return guestWithGroups;
+            // ----------------------------------------------------
+            // Work with Authenticated User who is not a Superuser
+            // ----------------------------------------------------
+            groupList.add(IndexServiceBean.getGroupPerUserPrefix() + au.getId());
         }
+        
+        // In addition to the user referenced directly, we will also
+        // add joins on all the non-public groups that may exist for the
+        // user:
 
-        // ----------------------------------------------------
-        // (2) Retrieve Authenticated User
-        // ----------------------------------------------------
-        if (!(user instanceof AuthenticatedUser)) {
-            logger.severe("Should never reach here. A User must be an AuthenticatedUser or a Guest");
-            throw new IllegalStateException("A User must be an AuthenticatedUser or a Guest");
-        }
+        // Authenticated users, *and the GuestUser*, may be part of one or more groups; such
+        // as IP Groups.
+        groups = groupService.collectAncestors(groupService.groupsFor(dataverseRequest));
 
-        AuthenticatedUser au = (AuthenticatedUser) user;
-
-        // Logged in user, has publication status facet
-        //
-        solrQuery.addFacetField(SearchFields.PUBLICATION_STATUS);
-
-        // ----------------------------------------------------
-        // (3) Is this a Super User?
-        //      Yes, give back everything
-        // ----------------------------------------------------
-        if (au.isSuperuser()) {
-            // Somewhat dangerous because this user (a superuser) will be able
-            // to see everything in Solr with no regard to permissions. But it's
-            // been this way since Dataverse 4.0. So relax. :)
-
-            return dangerZoneNoSolrJoin;
-        }
-
-        // ----------------------------------------------------
-        // (4) User is logged in AND onlyDatatRelatedToMe == true
-        // Yes, give back everything -> the settings will be in
-        //          the filterqueries given to search
-        // ----------------------------------------------------
-        if (onlyDatatRelatedToMe == true) {
-            if (systemConfig.myDataDoesNotUsePermissionDocs()) {
-                logger.fine("old 4.2 behavior: MyData is not using Solr permission docs");
-                return dangerZoneNoSolrJoin;
-            } else {
-                logger.fine("new post-4.2 behavior: MyData is using Solr permission docs");
-            }
-        }
-
-        // ----------------------------------------------------
-        // (5) Work with Authenticated User who is not a Superuser
-        // ----------------------------------------------------
-        /**
-         * @todo all this code needs cleanup and clarification.
-         */
-        /**
-         * Every AuthenticatedUser is part of a "User Private Group" (UGP), a
-         * concept we borrow from RHEL:
-         * https://access.redhat.com/site/documentation/en-US/Red_Hat_Enterprise_Linux/6/html/Deployment_Guide/ch-Managing_Users_and_Groups.html#s2-users-groups-private-groups
-         */
-        /**
-         * @todo rename this from publicPlusUserPrivateGroup. Confusing
-         */
-        // safe default: public only
-        String publicPlusUserPrivateGroup = publicOnly;
-//                    + (onlyDatatRelatedToMe ? "" : (publicOnly + " OR "))
-//                    + "{!join from=" + SearchFields.GROUPS + " to=" + SearchFields.PERMS + "}id:" + IndexServiceBean.getGroupPerUserPrefix() + au.getId() + ")";
-
-//            /**
-//             * @todo add onlyDatatRelatedToMe option into the experimental JOIN
-//             * before enabling it.
-//             */
-        /**
-         * From a search perspective, we don't care about if the group was
-         * created within one dataverse or another. We just want a list of *all*
-         * the groups the user is part of. We are greedy. We want all BuiltIn
-         * Groups, Shibboleth Groups, IP Groups, "system" groups, everything.
-         *
-         * A JOIN on "permission documents" will determine if the user can find
-         * a given "content document" (dataset version, etc) in Solr.
-         */
-        String groupsFromProviders = "";
-        Set<Group> groups = groupService.collectAncestors(groupService.groupsFor(dataverseRequest));
-        StringBuilder sb = new StringBuilder();
         for (Group group : groups) {
-            logger.fine("found group " + group.getIdentifier() + " with alias " + group.getAlias());
             String groupAlias = group.getAlias();
-            if (groupAlias != null && !groupAlias.isEmpty()) {
-                sb.append(" OR ");
-                // i.e. group_builtIn/all-users, group_builtIn/authenticated-users, group_1-explictGroup1, group_shib/2
-                sb.append(IndexServiceBean.getGroupPrefix() + groupAlias);
+            if (groupAlias != null && !groupAlias.isEmpty() && (!avoidJoin || !groupAlias.startsWith("builtIn"))) {
+                groupList.add(IndexServiceBean.getGroupPrefix() + groupAlias);
             }
         }
-        groupsFromProviders = sb.toString();
 
-        logger.fine(groupsFromProviders);
-        if (true) {
-            /**
-             * @todo get rid of "experimental" in name
-             */
-            String experimentalJoin = "{!join from=" + SearchFields.DEFINITION_POINT + " to=id}" + SearchFields.DISCOVERABLE_BY + ":(" + IndexServiceBean.getPublicGroupString() + " OR " + IndexServiceBean.getGroupPerUserPrefix() + au.getId() + groupsFromProviders + ")";
-            publicPlusUserPrivateGroup = experimentalJoin;
+        if (!avoidJoin) {
+            // Add the public group
+            groupList.add(0, IndexServiceBean.getPublicGroupString());
+        } 
+        
+        String groupString = null;
+        //If we have additional groups, format them correctly into a search string, with parens if there is more than one
+        if (groupList.size() > 1) {
+            groupString = "(" + StringUtils.join(groupList, " OR ") + ")";
+        } else if (groupList.size() == 1) {
+            groupString = groupList.get(0);
         }
-
-        //permissionFilterQuery = publicPlusUserPrivateGroup;
-        logger.fine(publicPlusUserPrivateGroup);
-
-        return publicPlusUserPrivateGroup;
-
+        logger.fine("Groups: " + groupString);
+        String permissionQuery = buildPermissionFilterQuery(avoidJoin, groupString);
+        logger.fine("Permission Query: " + permissionQuery);
+        return permissionQuery;
     }
 
+    private String buildPermissionFilterQuery(boolean avoidJoin, String permissionFilterGroups) {
+        String query = (avoidJoin&& !isAllGroups(permissionFilterGroups)) ? SearchFields.PUBLIC_OBJECT + ":" + true : "";
+        if (permissionFilterGroups != null && !isAllGroups(permissionFilterGroups)) {
+            if (!query.isEmpty()) {
+                query = "(" + query + " OR " + "{!join from=" + SearchFields.DEFINITION_POINT + " to=id v=$q1})&q1=" + SearchFields.DISCOVERABLE_BY + ":" + permissionFilterGroups;
+            } else {
+                query = "{!join from=" + SearchFields.DEFINITION_POINT + " to=id v=$q1}&q1=" + SearchFields.DISCOVERABLE_BY + ":" + permissionFilterGroups;
+            }
+        }
+        return query;
+    }
+    
+    private boolean isAllGroups(String groups) {
+        return (groups!=null &&groups.equals(ALL_GROUPS));
+    }
 }
 
